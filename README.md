@@ -82,7 +82,7 @@ Works, each tested on the Nano:
   elements (`nano-r32-video gst-launch-1.0 … nvv4l2decoder …`).
 - NVIDIA DeepStream 6.0.1, as an optional extra from a JetPack 4
   environment beside Ubuntu 26.04: NVIDIA's 1080p sample decoded, run
-  through a detector and encoded again at 86 frames a second
+  through a detector and encoded again at 78 to 86 frames a second
   ([docs/DEEPSTREAM.md](docs/DEEPSTREAM.md)).
 - USB 2 and 3, Wi-Fi through a USB adapter, a USB webcam with its
   microphone, the 5 W and MAXN power modes and the fan. The CPU, GPU and

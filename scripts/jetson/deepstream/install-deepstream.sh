@@ -189,6 +189,7 @@ present=''
 for p in nvidia-l4t-init nvidia-l4t-tools nvidia-l4t-xusb-firmware; do
     grep -q "^$p " "$record/packages.txt" && present+="$p "
 done
+present=${present% }
 note "FLASH_PACKAGES_IN_ROOT=${present:-none} (inert in the root: docs/DEEPSTREAM.md)"
 
 # --- 5. Libraries, EGL and GStreamer.

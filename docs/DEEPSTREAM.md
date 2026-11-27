@@ -28,18 +28,20 @@ On the project's Nano, 2026-11-27, with `deepstream-app` on NVIDIA's
 sample clip (`sample_1080p_h264.mp4`, 1,443 frames): hardware decoding,
 streams batched at 1280x720, the sample ResNet-10 detector in FP16 with
 batch 1, boxes drawn and hardware H.264 encoding to a file, with no
-playback timing (the sink's `sync=0`).
+playback timing (the sink's `sync=0`). Two runs: the experiment this extra
+came from, and
+[install-deepstream.sh](../scripts/jetson/deepstream/install-deepstream.sh)
+as published here, from an empty folder to its check.
 
-| | |
-| --- | --- |
-| Frames a second | 86 (85.5 on average) |
-| Frames with detections | 1,442 of 1,443 |
-| Objects | 17,743: 14,053 cars, 3,555 people, 133 bicycles, 2 road signs |
+| | Experiment | Fresh install |
+| --- | --- | --- |
+| Frames a second, last 5 s (average) | 86.1 (85.5) | 78.5 (77.9) |
+| Frames with detections | 1,442 of 1,443 | 1,442 of 1,443 |
+| Objects | 17,743 | 17,748 |
+| Cars, people, bicycles, road signs | 14,053, 3,555, 133, 2 | 14,060, 3,553, 133, 2 |
+| Check's time, TensorRT engine build included | (engine built earlier) | 123 s |
 
-That run came from the experiment that became
-[install-deepstream.sh](../scripts/jetson/deepstream/install-deepstream.sh),
-with the same packages, settings and check. The installer as published
-here has not yet run end to end on the Nano.
+Why the second run was slower is not known; it was not repeated.
 
 ## Install
 
