@@ -1,0 +1,53 @@
+# What can be checked without a Jetson Nano. Nothing here shows that a
+# board works; that takes the checks in tests/ run on the Nano itself.
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    name: Scripts and the converter's PC test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools the test uses
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends fdisk gnupg xz-utils
+      - name: Shell and Python syntax
+        run: |
+          set -e
+          git ls-files '*.sh' | xargs -n 1 bash -n
+          bash -n scripts/jetson/convert/nano26-first-boot
+          bash -n scripts/jetson/convert/nano26-stage2
+          git ls-files '*.py' | xargs python3 -m py_compile
+          python3 -c "import ast; ast.parse(open('scripts/jetson/convert/nano26-convert').read())"
+      - name: The converter against stand-ins for NVIDIA's servers
+        run: python3 tests/convert/test_nano26_convert.py
+
+  patches:
+    name: Kernel patches apply to the pinned source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch NVIDIA's 5.10 kernel source at the pinned commit
+        run: |
+          set -e
+          git init -q kernel
+          git -C kernel remote add origin https://github.com/OE4T/linux-tegra-5.10
+          git -C kernel fetch -q --depth 1 origin 4bce4d148ef3ff159ab55c127d8761aeaac5cc28
+          git -C kernel checkout -q FETCH_HEAD
+      - name: Apply the 27 patches in order
+        run: |
+          set -e
+          for p in patches/jp5/0*.patch; do
+            git -C kernel apply --whitespace=nowarn "$PWD/$p"
+          done
+          git -C kernel add -A -N .
+          stat=$(git -C kernel diff --shortstat)
+          echo "$stat"
+          test "$stat" = " 35 files changed, 1523 insertions(+), 77 deletions(-)"

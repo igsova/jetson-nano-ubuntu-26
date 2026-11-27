@@ -1,0 +1,39 @@
+video: tegra: fb: take over the firmware framebuffer
+
+JetPack 4's X driver opens /dev/fb0 by name, and its library pairs
+/dev/fbN with display head N. The device tree keeps the boot console on
+simplefb, which registers first, so tegradc's framebuffer became fb1 and X
+sized the screen from simplefb's single mode (800x600).
+
+Give tegra_fb an aperture over the whole address space before it registers.
+5.10's framebuffer core then removes the firmware framebuffer it overlaps,
+and tegra_fb becomes fb0 and takes the console, as under 4.9.
+
+Found: trial 22. Tested on the Nano: trial 23 logged "fb0: switching to
+tegra_fb from simple" and X sized the screen at 1920x1080.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/video/tegra/fb.c b/nvidia/drivers/video/tegra/fb.c
+--- a/nvidia/drivers/video/tegra/fb.c
++++ b/nvidia/drivers/video/tegra/fb.c
+@@ -1396,6 +1396,19 @@ struct tegra_fb_info *tegra_fb_register(struct platform_device *ndev,
+ 
+ 	tegra_fb_set_par(info);
+ 
++	/*
++	 * Take over from a firmware framebuffer (simplefb on the bootloader's
++	 * buffer, which carries the boot console until now) so this one gets
++	 * its number, fb0 for head 0, as under 4.9: JetPack 4's Xorg driver
++	 * opens /dev/fb0 by name, and its libnvdc pairs /dev/fbN with
++	 * /dev/tegra_dc_N.
++	 */
++	info->apertures = alloc_apertures(1);
++	if (info->apertures) {
++		info->apertures->ranges[0].base = 0;
++		info->apertures->ranges[0].size = ~0;
++	}
++
+ 	if (register_framebuffer(info)) {
+ 		dev_err(&ndev->dev, "failed to register framebuffer\n");
+ 		ret = -ENODEV;

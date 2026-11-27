@@ -1,0 +1,105 @@
+iommu/tegra-smmu: flush each page entry when it is mapped
+
+R35's tegra-smmu writes a page entry in its map function and leaves the
+cache clean and the SMMU's page-table cache and TLB flush to
+iotlb_sync_map, which misses entries: the IOMMU core starts a new gather
+for each contiguous chunk, so after a scattered buffer only the last chunk
+is flushed, and the sync takes end - start as the size while end is the
+last byte, so it drops the last page and a one-page map flushes nothing.
+The SMMU then reads zeros for entries the CPU has not written back yet, and
+keeps them. The display faulted on the boot logo, the console and the
+cursor while debugfs showed their entries mapped.
+
+Write each entry through a helper that cleans it and flushes its page-table
+cache line and TLB group at once, as mainline's driver does, and drop
+iotlb_sync_map. The unmap sync now counts the last page.
+
+Tested off the board: in a model of the CPU cache, page-table cache and TLB
+around the driver's real code, R35's left 2,048 of the boot framebuffer's
+2,048 entries unflushed; with this patch, none.
+Found: trial 23 (tens of thousands of faults). Tested on the Nano: trial 24
+had no fault in the whole boot, and the logo, console, desktop and cursor
+looked as under 4.9.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/iommu/tegra-smmu.c b/drivers/iommu/tegra-smmu.c
+--- a/drivers/iommu/tegra-smmu.c
++++ b/drivers/iommu/tegra-smmu.c
+@@ -646,6 +646,21 @@ static u32 *as_get_pte(struct tegra_smmu_as *as, dma_addr_t iova,
+ 	return tegra_smmu_pte_offset(as->pts[pde], iova);
+ }
+ 
++static void tegra_smmu_set_pte(struct tegra_smmu_as *as, unsigned long iova,
++			       u32 *pte, dma_addr_t pte_dma, u32 val)
++{
++	struct tegra_smmu *smmu = as->smmu;
++	unsigned long offset = SMMU_OFFSET_IN_PAGE(pte);
++
++	*pte = val;
++
++	dma_sync_single_range_for_device(smmu->dev, pte_dma, offset,
++					 4, DMA_TO_DEVICE);
++	smmu_flush_ptc(smmu, pte_dma, offset);
++	smmu_flush_tlb_group(smmu, as->id, iova);
++	smmu_flush(smmu);
++}
++
+ static void tegra_smmu_pte_get_use(struct tegra_smmu_as *as, unsigned long iova)
+ {
+ 	unsigned int pd_index = iova_pd_index(iova);
+@@ -745,9 +760,15 @@ __tegra_smmu_map(struct iommu_domain *domain, unsigned long iova,
+ 	if (prot & IOMMU_WRITE)
+ 		pte_attrs |= SMMU_PTE_WRITABLE;
+ 
+-	*pte = SMMU_PHYS_PFN(paddr) | pte_attrs;
+-
+-	iommu_iotlb_gather_add_page(domain, gather, iova, size);
++	/*
++	 * Write the entry back and flush it now, as mainline does.
++	 * iotlb_sync_map cannot do it: __iommu_map() starts a new gather for
++	 * each physically contiguous chunk, so after iommu_map_sg() only the
++	 * last chunk would be flushed. Until then the SMMU reads a stale
++	 * entry from memory and faults, as display0a and displayhc did.
++	 */
++	tegra_smmu_set_pte(as, iova, pte, pte_dma,
++			   SMMU_PHYS_PFN(paddr) | pte_attrs);
+ 
+ 	return 0;
+ }
+@@ -939,13 +960,25 @@ static int tegra_smmu_of_xlate(struct device *dev,
+ static void tegra_smmu_iotlb_sync(struct iommu_domain *domain,
+ 				  struct iommu_iotlb_gather *gather)
+ {
+-	unsigned long start = gather->start, size = gather->end - gather->start;
++	unsigned long start = gather->start, size;
+ 	struct tegra_smmu_as *as = to_smmu_as(domain);
+ 	struct tegra_smmu *smmu = as->smmu;
+-	unsigned int total = size >> SMMU_PTE_SHIFT;
+ 	unsigned long flags;
++	unsigned int total;
+ 	unsigned int len;
+ 
++	/*
++	 * gather->end is the last byte, so a range of n pages spans
++	 * end - start + 1 bytes; without the + 1 the last page of every
++	 * unmap was left in the TLB with its page table use counted. An
++	 * empty gather has start > end.
++	 */
++	if (gather->start > gather->end)
++		return;
++
++	size = gather->end - gather->start + 1;
++	total = size >> SMMU_PTE_SHIFT;
++
+ 	spin_lock_irqsave(&as->lock, flags);
+ 
+ 	for (; total; total -= len) {
+@@ -1037,7 +1070,6 @@ static const struct iommu_ops tegra_smmu_ops = {
+ 	.device_group = tegra_smmu_device_group,
+ 	.map = tegra_smmu_map,
+ 	.unmap = tegra_smmu_unmap,
+-	.iotlb_sync_map = tegra_smmu_iotlb_sync,
+ 	.iotlb_sync = tegra_smmu_iotlb_sync,
+ 	.iova_to_phys = tegra_smmu_iova_to_phys,
+ 	.of_xlate = tegra_smmu_of_xlate,

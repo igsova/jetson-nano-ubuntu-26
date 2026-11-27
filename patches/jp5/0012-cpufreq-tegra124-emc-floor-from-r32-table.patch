@@ -1,0 +1,154 @@
+cpufreq: tegra124: memory clock floor from the CPU clock, as R32
+
+Upstream's tegra124-cpufreq, which handles Tegra210 too, moves the CPU onto
+its DFLL clock and scales it. R32's own driver also set a floor for the
+memory clock from the CPU clock, which is what keeps memory at 1600 MHz
+under 4.9; upstream's has no such floor.
+
+Add it: on each CPU frequency change, ask the bandwidth manager for the
+memory rate that the device tree's emc-cpu-limit-table gives the new CPU
+rate, raised before the CPU speeds up and lowered after it slows down, with
+R32's lookup.
+
+Tested off the board: the lookup gave R32's floors for 15 CPU rates.
+Tested on the Nano: in trial 15 the CPU ran up to 1479 MHz on the DFLL, the
+floor held memory at 1600 MHz, and a CPU benchmark matched 4.9 at the same
+clocks.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/cpufreq/tegra124-cpufreq.c b/drivers/cpufreq/tegra124-cpufreq.c
+index 7a1ea6fdc..d53f26ce0 100644
+--- a/drivers/cpufreq/tegra124-cpufreq.c
++++ b/drivers/cpufreq/tegra124-cpufreq.c
+@@ -14,7 +14,9 @@
+ #include <linux/of_device.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/platform/tegra/emc_bwmgr.h>
+ #include <linux/pm_opp.h>
++#include <linux/slab.h>
+ #include <linux/types.h>
+ 
+ struct tegra124_cpufreq_priv {
+@@ -25,6 +27,107 @@ struct tegra124_cpufreq_priv {
+ 	struct platform_device *cpufreq_dt_pdev;
+ };
+ 
++/*
++ * Memory clock floor from the CPU clock, as JetPack 4's (R32) Tegra210 cpufreq
++ * driver sets it: the cpufreq node's emc-scaling-data lists (CPU kHz, EMC kHz)
++ * pairs in emc-cpu-limit-table, and each CPU rate asks the bandwidth manager
++ * for the EMC rate of the last pair it reaches. The manager starts with the
++ * other device_initcalls, so the request starts at late_initcall_sync from the
++ * last CPU rate seen.
++ */
++static DEFINE_MUTEX(cpu_emc_lock);
++static struct tegra_bwmgr_client *cpu_emc_bwmgr;
++static u32 *cpu_emc_table;
++static int cpu_emc_pairs;
++static unsigned int cpu_emc_khz;
++
++/* Call with cpu_emc_lock held. */
++static void tegra124_cpu_emc_update(unsigned int khz)
++{
++	unsigned long rate = 0;
++	int i;
++
++	cpu_emc_khz = khz;
++	if (!cpu_emc_bwmgr)
++		return;
++
++	for (i = 0; i < cpu_emc_pairs && khz >= cpu_emc_table[2 * i]; i++)
++		rate = cpu_emc_table[2 * i + 1] * 1000UL;
++
++	tegra_bwmgr_set_emc(cpu_emc_bwmgr, rate, TEGRA_BWMGR_SET_EMC_FLOOR);
++	pr_debug("cpu %u kHz: emc floor %lu Hz\n", khz, rate);
++}
++
++/* Raise the floor before the CPU speeds up; lower it after it slows down. */
++static int tegra124_cpu_emc_notify(struct notifier_block *nb,
++				   unsigned long event, void *data)
++{
++	struct cpufreq_freqs *freqs = data;
++
++	if (event == CPUFREQ_POSTCHANGE ||
++	    (event == CPUFREQ_PRECHANGE && freqs->new > freqs->old)) {
++		mutex_lock(&cpu_emc_lock);
++		tegra124_cpu_emc_update(freqs->new);
++		mutex_unlock(&cpu_emc_lock);
++	}
++
++	return NOTIFY_OK;
++}
++
++static struct notifier_block tegra124_cpu_emc_nb = {
++	.notifier_call = tegra124_cpu_emc_notify,
++};
++
++static int __init tegra124_cpu_emc_init(void)
++{
++	struct device_node *np, *scaling;
++	struct tegra_bwmgr_client *bwmgr;
++	int n;
++
++	np = of_find_compatible_node(NULL, NULL, "nvidia,tegra210-cpufreq");
++	scaling = of_get_child_by_name(np, "emc-scaling-data");
++	of_node_put(np);
++	if (!scaling)
++		return 0;
++
++	n = of_property_count_u32_elems(scaling, "emc-cpu-limit-table");
++	if (n <= 0 || n % 2) {
++		pr_err("invalid emc-cpu-limit-table: %d\n", n);
++		goto put;
++	}
++
++	cpu_emc_table = kcalloc(n, sizeof(*cpu_emc_table), GFP_KERNEL);
++	if (!cpu_emc_table ||
++	    of_property_read_u32_array(scaling, "emc-cpu-limit-table",
++				       cpu_emc_table, n))
++		goto free;
++
++	bwmgr = tegra_bwmgr_register(TEGRA_BWMGR_CLIENT_CPU_CLUSTER_0);
++	if (IS_ERR_OR_NULL(bwmgr)) {
++		pr_err("no EMC bandwidth manager for the CPU floor: %ld\n",
++		       PTR_ERR(bwmgr));
++		goto free;
++	}
++
++	mutex_lock(&cpu_emc_lock);
++	cpu_emc_pairs = n / 2;
++	cpu_emc_bwmgr = bwmgr;
++	tegra124_cpu_emc_update(cpu_emc_khz ?: cpufreq_quick_get(0));
++	pr_info("EMC floor follows the CPU clock (%d steps), now for %u kHz\n",
++		cpu_emc_pairs, cpu_emc_khz);
++	mutex_unlock(&cpu_emc_lock);
++	of_node_put(scaling);
++	return 0;
++
++free:
++	kfree(cpu_emc_table);
++	cpu_emc_table = NULL;
++put:
++	of_node_put(scaling);
++	return 0;
++}
++late_initcall_sync(tegra124_cpu_emc_init);
++
+ static int tegra124_cpu_switch_to_dfll(struct tegra124_cpufreq_priv *priv)
+ {
+ 	struct clk *orig_parent;
+@@ -215,6 +318,12 @@ static int __init tegra_cpufreq_init(void)
+ 		return PTR_ERR(pdev);
+ 	}
+ 
++	/* Follow the CPU rate from the start for the EMC floor. */
++	ret = cpufreq_register_notifier(&tegra124_cpu_emc_nb,
++					CPUFREQ_TRANSITION_NOTIFIER);
++	if (ret)
++		pr_err("no EMC floor from the CPU clock: %d\n", ret);
++
+ 	return 0;
+ }
+ module_init(tegra_cpufreq_init);

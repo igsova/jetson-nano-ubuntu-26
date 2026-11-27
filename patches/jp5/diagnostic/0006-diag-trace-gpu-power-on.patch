@@ -1,0 +1,185 @@
+nvgpu: trace the GPU's power-on (diagnostic, not applied)
+
+For trials 7 and 8. Trial 6's 5.10 boot stopped completing SD card I/O
+right when nvgpu first powered the GPU. This prints who started the
+power-on, each init step before it runs, the rail gating, the first DVFS
+voltage requests and the result of each gm20b clock step. It changes no
+behaviour.
+
+Trial 7's last logged step was init_clk_support, which led to 0007.
+Applied in trials 7 to 24; set aside for trial 25. The other patches apply
+without it.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/soc/tegra/tegra-dvfs.c b/nvidia/drivers/soc/tegra/tegra-dvfs.c
+index 9c892a43b..1b88366aa 100644
+--- a/nvidia/drivers/soc/tegra/tegra-dvfs.c
++++ b/nvidia/drivers/soc/tegra/tegra-dvfs.c
+@@ -174,8 +174,14 @@ static void dvfs_rail_stats_update(
+ 
+ static int dvfs_rail_set_voltage_reg(struct dvfs_rail *rail, int millivolts)
+ {
++	static unsigned int traced;
+ 	int ret;
+ 
++	if (traced < 200) {
++		traced++;
++		pr_info("tegra_dvfs: %s to %d mV\n", rail->reg_id, millivolts);
++	}
++
+ 	if (rail->joint_rail_with_dfll)
+ 		tegra_dfll_set_external_floor_mv(rail->new_millivolts);
+ 
+@@ -1657,6 +1663,7 @@ int tegra_dvfs_rail_power_up(struct dvfs_rail *rail)
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&dvfs_lock);
++	pr_info("tegra_dvfs: %s power up\n", rail->reg_id);
+ 	if (rail->reg) {
+ 		ret = regulator_enable(rail->reg);
+ 		if (!ret && !timekeeping_suspended) {
+@@ -1678,6 +1685,7 @@ int tegra_dvfs_rail_power_down(struct dvfs_rail *rail)
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&dvfs_lock);
++	pr_info("tegra_dvfs: %s power down\n", rail->reg_id);
+ 	if (rail->reg) {
+ 		ret = regulator_disable(rail->reg);
+ 		if (!ret && !timekeeping_suspended) {
+diff --git a/nvidia/nvgpu/drivers/gpu/nvgpu/common/init/nvgpu_init.c b/nvidia/nvgpu/drivers/gpu/nvgpu/common/init/nvgpu_init.c
+index cbb099d2a..68246b038 100644
+--- a/nvidia/nvgpu/drivers/gpu/nvgpu/common/init/nvgpu_init.c
++++ b/nvidia/nvgpu/drivers/gpu/nvgpu/common/init/nvgpu_init.c
+@@ -775,8 +775,8 @@ static int nvgpu_early_init(struct gk20a *g)
+ 				   nvgpu_early_init_table[i].enable_flag,
+ 				   nvgpu_early_init_table[i].func);
+ 		} else {
+-			nvgpu_log_info(g, "Initializing %s",
+-					   nvgpu_early_init_table[i].name);
++			nvgpu_info(g, "Initializing %s",
++				   nvgpu_early_init_table[i].name);
+ 			err = nvgpu_early_init_table[i].func(g);
+ 			if (err != 0) {
+ 				nvgpu_err(g, "Failed initialization for: %s",
+@@ -1003,8 +1003,8 @@ int nvgpu_finalize_poweron(struct gk20a *g)
+ 				       nvgpu_init_table[i].enable_flag,
+ 				       nvgpu_init_table[i].func);
+ 		} else {
+-			nvgpu_log_info(g, "Initializing %s",
+-				       nvgpu_init_table[i].name);
++			nvgpu_info(g, "Initializing %s",
++				   nvgpu_init_table[i].name);
+ 			err = nvgpu_init_table[i].func(g);
+ 			if (err != 0) {
+ 				nvgpu_err(g, "Failed initialization for: %s",
+diff --git a/nvidia/nvgpu/drivers/gpu/nvgpu/hal/clk/clk_gm20b.c b/nvidia/nvgpu/drivers/gpu/nvgpu/hal/clk/clk_gm20b.c
+index 34d3ae904..460abedc0 100644
+--- a/nvidia/nvgpu/drivers/gpu/nvgpu/hal/clk/clk_gm20b.c
++++ b/nvidia/nvgpu/drivers/gpu/nvgpu/hal/clk/clk_gm20b.c
+@@ -1301,7 +1301,9 @@ int gm20b_clk_prepare(struct clk_gk20a *clk)
+ 
+ 	nvgpu_mutex_acquire(&clk->clk_mutex);
+ 	if (!clk->gpc_pll.enabled && clk->clk_hw_on) {
++		nvgpu_info(clk->g, "clk: gpcclk prepare sets the PLL");
+ 		ret = set_pll_freq(clk->g, true);
++		nvgpu_info(clk->g, "clk: gpcclk prepare PLL %d", ret);
+ 	}
+ 	nvgpu_mutex_release(&clk->clk_mutex);
+ 	return ret;
+@@ -1494,12 +1496,14 @@ int gm20b_init_clk_support(struct gk20a *g)
+ 
+ 	err = gm20b_init_clk_setup_hw(g);
+ 	nvgpu_mutex_release(&clk->clk_mutex);
++	nvgpu_info(g, "clk: hw setup %d", err);
+ 	if (err != 0) {
+ 		return err;
+ 	}
+ 
+ 	/* FIXME: this effectively prevents host level clock gating */
+ 	err = g->ops.clk.prepare_enable(&g->clk);
++	nvgpu_info(g, "clk: prepare_enable %d", err);
+ 	if (err != 0) {
+ 		return err;
+ 	}
+@@ -1510,6 +1514,7 @@ int gm20b_init_clk_support(struct gk20a *g)
+ 		err = set_pll_freq(g, true);
+ 	}
+ 	nvgpu_mutex_release(&clk->clk_mutex);
++	nvgpu_info(g, "clk: PLL %d at %u kHz gpc2clk", err, clk->gpc_pll.freq);
+ 
+ 	return err;
+ }
+diff --git a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/module.c b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/module.c
+index f17087177..730121632 100644
+--- a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/module.c
++++ b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/module.c
+@@ -26,6 +26,7 @@
+ #include <linux/reset.h>
+ #include <linux/reboot.h>
+ #include <linux/notifier.h>
++#include <linux/sched.h>
+ 
+ #include <nvgpu/vpr.h>
+ 
+@@ -454,6 +455,8 @@ int gk20a_pm_finalize_poweron(struct device *dev)
+ 		goto done;
+ 
+ 	nvgpu_set_power_state(g, NVGPU_STATE_POWERING_ON);
++	nvgpu_info(g, "power-on started by %s[%d]", current->comm,
++		   task_pid_nr(current));
+ 
+ #ifdef CONFIG_NVGPU_TRACE
+ 	trace_gk20a_finalize_poweron(dev_name(dev));
+@@ -523,6 +526,7 @@ int gk20a_pm_finalize_poweron(struct device *dev)
+ 	}
+ #endif
+ 
++	nvgpu_info(g, "power-on: enabling interrupts");
+ 	err = nvgpu_enable_irqs(g);
+ 	if (err) {
+ 		nvgpu_err(g, "failed to enable irqs %d", err);
+@@ -553,6 +557,7 @@ int gk20a_pm_finalize_poweron(struct device *dev)
+ #endif
+ 
+ 
++	nvgpu_info(g, "power-on: frequency scaling");
+ 	/* Initialise scaling: it will initialize scaling drive only once */
+ 	if (IS_ENABLED(CONFIG_GK20A_DEVFREQ) &&
+ 			nvgpu_platform_is_silicon(g)) {
+@@ -581,6 +586,7 @@ int gk20a_pm_finalize_poweron(struct device *dev)
+ 	g->sw_ready = true;
+ 
+ 	nvgpu_set_power_state(g, NVGPU_STATE_POWERED_ON);
++	nvgpu_info(g, "power-on done");
+ 
+ done:
+ 	if (err != 0) {
+diff --git a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c
+index 504c51ac7..a04276b76 100644
+--- a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c
++++ b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c
+@@ -365,6 +365,7 @@ static int gm20b_tegra_railgate(struct device *dev)
+ 	struct gk20a_platform *platform = dev_get_drvdata(dev);
+ 	int ret = 0;
+ 
++	nvgpu_info(g, "railgate");
+ #ifdef CONFIG_NV_TEGRA_MC
+ #ifdef CONFIG_TEGRA_DVFS
+ 	if (nvgpu_is_enabled(g, NVGPU_IS_FMODEL) ||
+@@ -439,6 +440,7 @@ static int gm20b_tegra_unrailgate(struct device *dev)
+ 	if (nvgpu_is_enabled(g, NVGPU_IS_FMODEL))
+ 		return 0;
+ 
++	nvgpu_info(g, "unrailgate");
+ 	ret = tegra_dvfs_rail_power_up(platform->gpu_rail);
+ 	if (ret)
+ 		return ret;
+@@ -509,6 +511,7 @@ static int gm20b_tegra_unrailgate(struct device *dev)
+ 
+ 	udelay(10);
+ 
++	nvgpu_info(g, "unrailgate done");
+ 	return 0;
+ 
+ err_clk_on:

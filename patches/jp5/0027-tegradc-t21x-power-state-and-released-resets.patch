@@ -1,0 +1,240 @@
+video: tegra: dc: real power state and released resets on Tegra210
+
+Two 5.10-only problems in JetPack 4's display driver:
+
+- tegra_dc_is_powered() returned whether runtime PM was enabled for the
+  head's power domain, which is true from attach on. The interrupt handler
+  then read an unpowered head after a blank ("Host read timeout at address
+  542000dc"). Ask genpd whether the domain is on, as 4.9 asked the PMC.
+- tegradc took the SOR1 and DPAUX1 resets for good. 5.10's PMC must
+  acquire every reset its sor domain lists before powering it off, so each
+  power-off failed with -EBUSY and the partition never powered off. Get
+  both resets released and acquire each only around its use, as upstream's
+  tegra-drm does.
+
+Found: in every 5.10 boot since trial 21. Tested on the Nano (with 0028):
+trial 37 had no "failed to acquire resets" (11 in trial 36) and no read
+timeout; the display partitions powered off with a blank and on with the
+unblank, and HDMI came back at 1920x1080.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/video/tegra/dc/dc_priv.h b/nvidia/drivers/video/tegra/dc/dc_priv.h
+index 08b7546c8..75394db12 100644
+--- a/nvidia/drivers/video/tegra/dc/dc_priv.h
++++ b/nvidia/drivers/video/tegra/dc/dc_priv.h
+@@ -35,6 +35,7 @@
+ #include <soc/tegra/bpmp-abi.h>
+ #include <soc/tegra/bpmp.h>
+ #include <linux/extcon-provider.h>
++#include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #endif
+ 
+@@ -499,13 +500,29 @@ static int t21x_disp_pd_enable(struct tegra_dc *dc)
+ 	return pm_runtime_get_sync(pd->genpd_dev);
+ }
+ 
++/*
++ * Whether the power domain behind a device from dev_pm_domain_attach_by_name()
++ * is on, as 4.9's tegra_powergate_is_powered() reported for the partition.
++ * pm_runtime_enabled() on that device, used before, is true from attach on,
++ * so tegradc read the head after its partition had powered off (a host1x
++ * read timeout at DC_CMD_INT_STATUS from the interrupt handler).
++ */
++static inline bool tegra_dc_genpd_dev_is_on(struct device *genpd_dev)
++{
++	if (IS_ERR_OR_NULL(genpd_dev) || !genpd_dev->pm_domain)
++		return true;
++
++	return READ_ONCE(pd_to_genpd(genpd_dev->pm_domain)->status) ==
++		GENPD_STATE_ON;
++}
++
+ static int t21x_disp_is_pd_enabled(struct tegra_dc *dc)
+ {
+ 	struct tegra_dc_pd_table *pd_table = tegra_dc_get_disp_pd_table();
+ 	struct tegra_dc_pd_info *pds = pd_table->pd_entries;
+ 	struct tegra_dc_pd_info *pd = &pds[dc->ctrl_num];
+ 
+-	return pm_runtime_enabled(pd->genpd_dev);
++	return tegra_dc_genpd_dev_is_on(pd->genpd_dev);
+ }
+ #endif
+ 
+diff --git a/nvidia/drivers/video/tegra/dc/dpaux.c b/nvidia/drivers/video/tegra/dc/dpaux.c
+index 0555a21e7..5c3ae61eb 100644
+--- a/nvidia/drivers/video/tegra/dc/dpaux.c
++++ b/nvidia/drivers/video/tegra/dc/dpaux.c
+@@ -62,6 +62,40 @@ tegra_dpaux_poll_register(struct tegra_dc_dpaux_data *dpaux,
+ 	return jiffies - timeout_jf + 1;
+ }
+ 
++#if KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
++/*
++ * The PMC's SOR power domain lists the DPAUX resets too, as R32's 4.9
++ * partition table did, and must acquire them to power the partition off; so,
++ * as for the SOR's reset (sor.h), take this one only around each use.
++ */
++static int tegra_dpaux_rst_acquire(struct tegra_dc *dc,
++				   struct reset_control *rst)
++{
++	int err = reset_control_acquire(rst);
++
++	if (err)
++		dev_warn(&dc->ndev->dev,
++			"dpaux: reset held by its power domain (%d), skipped\n",
++			err);
++	return err;
++}
++
++static void tegra_dpaux_rst_release(struct reset_control *rst)
++{
++	reset_control_release(rst);
++}
++#else
++static int tegra_dpaux_rst_acquire(struct tegra_dc *dc,
++				   struct reset_control *rst)
++{
++	return 0;
++}
++
++static void tegra_dpaux_rst_release(struct reset_control *rst)
++{
++}
++#endif
++
+ static void tegra_dpaux_reset(struct tegra_dc_dpaux_data *dpaux)
+ {
+ 	if (tegra_platform_is_sim())
+@@ -74,11 +108,12 @@ static void tegra_dpaux_reset(struct tegra_dc_dpaux_data *dpaux)
+ 	if (dpaux->dc->initialized)
+ 		return;
+ 
+-	if (dpaux->rst) {
++	if (dpaux->rst && !tegra_dpaux_rst_acquire(dpaux->dc, dpaux->rst)) {
+ 		reset_control_assert(dpaux->rst);
+ 		mdelay(2);
+ 		reset_control_deassert(dpaux->rst);
+ 		mdelay(1);
++		tegra_dpaux_rst_release(dpaux->rst);
+ 	}
+ }
+ 
+@@ -818,7 +853,12 @@ struct tegra_dc_dpaux_data *tegra_dpaux_init_data(struct tegra_dc *dc,
+ 	}
+ 
+ 	/* Extract the reset entry from the DT node. */
++#if KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
++	rst = __of_reset_control_get(dpaux_np, dpaux_name, 0, false, false,
++				     false);
++#else
+ 	rst = of_reset_control_get(dpaux_np, dpaux_name);
++#endif
+ 	if (IS_ERR_OR_NULL(rst)) {
+ 		dev_err(&dc->ndev->dev,
+ 			"%s: Unable to get %s reset control\n",
+@@ -826,7 +866,10 @@ struct tegra_dc_dpaux_data *tegra_dpaux_init_data(struct tegra_dc *dc,
+ 		err = -ENOENT;
+ 		goto err_put_clk;
+ 	}
+-	reset_control_deassert(rst);
++	if (!tegra_dpaux_rst_acquire(dc, rst)) {
++		reset_control_deassert(rst);
++		tegra_dpaux_rst_release(rst);
++	}
+ 
+ 	if (!tegra_platform_is_sim()) {
+ 		prod_list = devm_tegra_prod_get_from_node(
+diff --git a/nvidia/drivers/video/tegra/dc/sor.c b/nvidia/drivers/video/tegra/dc/sor.c
+index bf9b11c9e..91a9dd450 100644
+--- a/nvidia/drivers/video/tegra/dc/sor.c
++++ b/nvidia/drivers/video/tegra/dc/sor.c
+@@ -497,7 +497,7 @@ static int dbg_sor_show(struct seq_file *s, void *unused)
+ 
+ 	if (tegra_dc_is_t21x()) {
+ #if KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
+-		if (!pm_runtime_enabled(sor->genpd_dev)) {
++		if (!tegra_dc_genpd_dev_is_on(sor->genpd_dev)) {
+ #else
+ 		if (!tegra_powergate_is_powered(sor->powergate_id)) {
+ #endif
+diff --git a/nvidia/drivers/video/tegra/dc/sor.h b/nvidia/drivers/video/tegra/dc/sor.h
+index 2a0d65641..8bd8e82f7 100644
+--- a/nvidia/drivers/video/tegra/dc/sor.h
++++ b/nvidia/drivers/video/tegra/dc/sor.h
+@@ -565,16 +565,59 @@ static inline void tegra_sor_safe_clk_disable(struct tegra_dc_sor_data *sor)
+ 		clk_disable_unprepare(sor->safe_clk);
+ }
+ 
++#if KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
++/*
++ * On 5.4 and later the PMC's SOR power domain lists this reset too, and it
++ * must acquire the reset to power the partition off, which fails with -EBUSY
++ * while another exclusive control holds it. So get it released and acquire it
++ * only around each use (upstream's tegra-drm SOR driver also gets it released
++ * and gives it up before its domain powers off). While the partition is off
++ * the PMC holds it asserted, and powering the partition on deasserts it.
++ */
++static inline int tegra_sor_reset_acquire(struct tegra_dc_sor_data *sor)
++{
++	int err = reset_control_acquire(sor->rst);
++
++	if (err)
++		dev_warn(&sor->dc->ndev->dev,
++			"sor%d: reset held by its power domain (%d), skipped\n",
++			sor->ctrl_num, err);
++	return err;
++}
++
++static inline void tegra_sor_reset_release(struct tegra_dc_sor_data *sor)
++{
++	reset_control_release(sor->rst);
++}
++#else
++static inline int tegra_sor_reset_acquire(struct tegra_dc_sor_data *sor)
++{
++	return 0;
++}
++
++static inline void tegra_sor_reset_release(struct tegra_dc_sor_data *sor)
++{
++}
++#endif
++
+ static inline int tegra_get_sor_reset_ctrl(struct tegra_dc_sor_data *sor,
+ 	struct device_node *np_sor, const char *res_name)
+ {
++#if KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
++	sor->rst = __of_reset_control_get(np_sor, res_name, 0, false, false,
++					  false);
++#else
+ 	sor->rst = of_reset_control_get(np_sor, res_name);
++#endif
+ 	if (IS_ERR(sor->rst)) {
+ 		dev_err(&sor->dc->ndev->dev,
+ 			"Unable to get %s reset control\n", res_name);
+ 		return PTR_ERR(sor->rst);
+ 	}
+-	reset_control_deassert(sor->rst);
++	if (!tegra_sor_reset_acquire(sor)) {
++		reset_control_deassert(sor->rst);
++		tegra_sor_reset_release(sor);
++	}
+ 	return 0;
+ }
+ 
+@@ -584,11 +627,12 @@ static inline void tegra_sor_reset(struct tegra_dc_sor_data *sor)
+ 		return;
+ 
+ 	down_write(&sor->reset_lock);
+-	if (sor->rst) {
++	if (sor->rst && !tegra_sor_reset_acquire(sor)) {
+ 		reset_control_assert(sor->rst);
+ 		mdelay(2);
+ 		reset_control_deassert(sor->rst);
+ 		mdelay(1);
++		tegra_sor_reset_release(sor);
+ 	}
+ 	up_write(&sor->reset_lock);
+ }

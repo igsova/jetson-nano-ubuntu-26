@@ -1,0 +1,122 @@
+soc/tegra: tegra210-dvfs: EMC rates per core voltage from R32's tables
+
+The core rail's voltage table gives each clock its highest rate per
+voltage. R35's entry for the memory clock is a placeholder, which R32
+replaced at boot from its EMC tables; R35 skips that step on 5.x ("EMC part
+is not enabled yet"). Every switch to 1600 MHz then failed with
+"tegra-dvfs: rate 1600000000 too high for dvfs on emc".
+
+On 5.x, read the board's EMC table nodes and give each core voltage the
+highest rate whose minimum voltage it meets, as R32's prediction does with
+the same tables: on the Nano, 204 MHz from 800 mV and 1600 MHz from 900 mV.
+
+Found: trial 13. Tested on the Nano: in trial 14 no switch was refused,
+memory ran at 1600 MHz with the core rail at 900 mV, and the CUDA baseline
+verified 53 batches in 10 s, as under 4.9 (6 at 204 MHz).
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/soc/tegra/tegra210-dvfs.c b/nvidia/drivers/soc/tegra/tegra210-dvfs.c
+index e86451553..1b7ef82cf 100644
+--- a/nvidia/drivers/soc/tegra/tegra210-dvfs.c
++++ b/nvidia/drivers/soc/tegra/tegra210-dvfs.c
+@@ -1546,9 +1546,30 @@ static int init_cpu_lp_dvfs_table(int *cpu_lp_max_freq_index)
+ 	return ret;
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
++/* JetPack 4's EMC table nodes for this board's RAM code, if any */
++static struct device_node *tegra210_emc_dt_tables(void)
++{
++	struct device_node *emc, *np;
++	u32 ram_code;
++
++	emc = of_find_compatible_node(NULL, NULL, "nvidia,tegra210-emc");
++	if (!emc || !of_property_read_bool(emc, "nvidia,use-ram-code"))
++		return emc;
++
++	for_each_child_of_node(emc, np) {
++		if (!of_property_read_u32(np, "nvidia,ram-code", &ram_code) &&
++		    ram_code == tegra_read_ram_code())
++			break;
++	}
++
++	of_node_put(emc);
++	return np;
++}
++#endif
++
+ static void adjust_emc_dvfs_from_timing_table(struct dvfs *d)
+ {
+-	/* FIXME EMC part is not enabled yet on K5.9 */
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+ 	unsigned long rate;
+ 	int i;
+@@ -1564,6 +1585,56 @@ static void adjust_emc_dvfs_from_timing_table(struct dvfs *d)
+ 		if (rate)
+ 			d->freqs[i] = rate;
+ 	}
++#else
++	/*
++	 * 5.10's EMC driver has no tegra210_predict_emc_rate() and need not
++	 * have probed yet, so read JetPack 4's EMC table nodes directly. As
++	 * R32's tegra210_predict_emc_rate() does with the same tables, each
++	 * core voltage gets the highest rate whose nvidia,emc-min-mv it
++	 * meets, in table order.
++	 */
++	struct device_node *tables, *np;
++	unsigned long rate, prev = 0;
++	u32 khz, mv;
++	int i;
++
++	tables = tegra210_emc_dt_tables();
++	if (!tables)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(core_millivolts); i++) {
++		if (core_millivolts[i] == 0)
++			break;
++
++		rate = 0;
++		for_each_child_of_node(tables, np) {
++			if (!of_device_is_compatible(np, "nvidia,tegra21-emc-table") &&
++			    !of_device_is_compatible(np, "nvidia,tegra210-emc-table"))
++				continue;
++
++			if (of_property_read_u32(np, "clock-frequency", &khz) ||
++			    of_property_read_u32(np, "nvidia,emc-min-mv", &mv))
++				continue;
++
++			if (mv > core_millivolts[i]) {
++				of_node_put(np);
++				break;
++			}
++
++			rate = khz * 1000UL;
++		}
++
++		if (!rate)
++			continue;
++
++		d->freqs[i] = rate;
++		if (rate != prev)
++			pr_info("tegra210_dvfs: emc up to %lu kHz from %d mV (%pOF)\n",
++				rate / 1000, core_millivolts[i], tables);
++		prev = rate;
++	}
++
++	of_node_put(tables);
+ #endif
+ }
+ 
+@@ -2117,8 +2188,8 @@ static void init_core_dvfs_table(int soc_speedo_id, int core_process_id)
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+ 		if (!strcmp(d->clk_name, "emc") && tegra210_emc_is_ready()) {
+ #else
+-		/* FIXME EMC part is not enabled yet on K5.9 */
+-		if (!strcmp(d->clk_name, "emc") && false) {
++		/* the timing table here is JetPack 4's EMC table nodes */
++		if (!strcmp(d->clk_name, "emc")) {
+ #endif
+ 			struct dvb_dvfs *dvbd = get_emc_dvb_dvfs(soc_speedo_id);
+ 

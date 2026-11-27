@@ -1,0 +1,349 @@
+dma-buf: sync_file: serve Android's older sync requests
+
+R32's 4.9 kernel served Android's older sync interface on fence fds:
+SYNC_IOC_WAIT, SYNC_IOC_MERGE and SYNC_IOC_FENCE_INFO. 5.10's sync_file has
+only the newer MERGE and FILE_INFO, so JetPack 4's video converter could
+neither read nor wait on its fences.
+
+Serve the three older requests with R32's layouts and behaviour beside the
+newer ones. A fence driver can register a function that adds its driver
+data and R32 driver name to each point; nvhost registers one that writes
+R32's {syncpoint id, threshold}. Build-time checks pin R32's structs at 40,
+80 and 40 bytes.
+
+Tested off the board: in user-mode Linux 5.10 built from this tree, a test
+with software fences passed 41 of 41 checks of the three requests.
+Found: trial 35. Tested on the Nano: in trial 36 the converter exited 0
+under 5.10; each of its 120 conversions read and waited on its fence
+without error.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/dma-buf/sync_file.c b/drivers/dma-buf/sync_file.c
+index bd8ac62..b5bbfa6 100644
+--- a/drivers/dma-buf/sync_file.c
++++ b/drivers/dma-buf/sync_file.c
+@@ -460,6 +460,201 @@ out:
+ 	return ret;
+ }
+ 
++/*
++ * Jetson Nano trial: Android's older sync interface, which JetPack 4's
++ * (L4T R32) userspace uses on fence fds and R32's 4.9 kernel served from
++ * drivers/staging/android/sync.c: requests 0 to 2 on the same '>' type, with
++ * these layouts. Mainline replaced them with SYNC_IOC_MERGE (3) and
++ * SYNC_IOC_FILE_INFO (4).
++ */
++struct sync_merge_data_r32 {
++	__s32	fd2;
++	char	name[32];
++	__s32	fence;
++};
++
++struct sync_pt_info_r32 {
++	__u32	len;
++	char	obj_name[32];
++	char	driver_name[32];
++	__s32	status;
++	__u64	timestamp_ns;
++	__u8	driver_data[0];
++};
++
++struct sync_fence_info_data_r32 {
++	__u32	len;
++	char	name[32];
++	__s32	status;
++	__u8	pt_info[0];
++};
++
++#define SYNC_IOC_WAIT_R32	_IOW(SYNC_IOC_MAGIC, 0, __s32)
++#define SYNC_IOC_MERGE_R32	_IOWR(SYNC_IOC_MAGIC, 1, struct sync_merge_data_r32)
++#define SYNC_IOC_FENCE_INFO_R32	_IOWR(SYNC_IOC_MAGIC, 2, \
++				      struct sync_fence_info_data_r32)
++
++static sync_file_r32_pt_fn sync_file_r32_pt;
++
++void sync_file_set_r32_pt_fn(sync_file_r32_pt_fn fn)
++{
++	WRITE_ONCE(sync_file_r32_pt, fn);
++}
++EXPORT_SYMBOL(sync_file_set_r32_pt_fn);
++
++/* As R32's sync_fence_wait(): milliseconds, and a negative wait has no limit. */
++static long sync_file_ioctl_wait_r32(struct sync_file *sync_file,
++				     unsigned long arg)
++{
++	__s32 value;
++	long ret;
++
++	if (copy_from_user(&value, (void __user *)arg, sizeof(value)))
++		return -EFAULT;
++
++	ret = dma_fence_wait_timeout(sync_file->fence, true,
++				     value < 0 ? MAX_SCHEDULE_TIMEOUT :
++				     msecs_to_jiffies(value));
++	if (ret < 0)
++		return ret;
++	if (ret == 0)
++		return -ETIME;
++
++	ret = dma_fence_get_status(sync_file->fence);
++	return ret < 0 ? ret : 0;
++}
++
++static long sync_file_ioctl_merge_r32(struct sync_file *sync_file,
++				      unsigned long arg)
++{
++	int fd = get_unused_fd_flags(O_CLOEXEC);
++	int err;
++	struct sync_file *fence2, *fence3;
++	struct sync_merge_data_r32 data;
++
++	if (fd < 0)
++		return fd;
++
++	if (copy_from_user(&data, (void __user *)arg, sizeof(data))) {
++		err = -EFAULT;
++		goto err_put_fd;
++	}
++
++	fence2 = sync_file_fdget(data.fd2);
++	if (!fence2) {
++		err = -ENOENT;
++		goto err_put_fd;
++	}
++
++	data.name[sizeof(data.name) - 1] = '\0';
++	fence3 = sync_file_merge(data.name, sync_file, fence2);
++	if (!fence3) {
++		err = -ENOMEM;
++		goto err_put_fence2;
++	}
++
++	data.fence = fd;
++	if (copy_to_user((void __user *)arg, &data, sizeof(data))) {
++		err = -EFAULT;
++		goto err_put_fence3;
++	}
++
++	fd_install(fd, fence3->file);
++	fput(fence2->file);
++	return 0;
++
++err_put_fence3:
++	fput(fence3->file);
++
++err_put_fence2:
++	fput(fence2->file);
++
++err_put_fd:
++	put_unused_fd(fd);
++	return err;
++}
++
++/* As R32's sync_fill_pt_info(), with the driver data from the fence's driver. */
++static int sync_fill_pt_info_r32(struct dma_fence *fence, void *data, int size)
++{
++	struct sync_pt_info_r32 *info = data;
++	const char *driver_name = fence->ops->get_driver_name(fence);
++	sync_file_r32_pt_fn fill = READ_ONCE(sync_file_r32_pt);
++	int ret;
++
++	if (size < (int)sizeof(*info))
++		return -ENOMEM;
++
++	info->len = sizeof(*info);
++	if (fill) {
++		ret = fill(fence, &driver_name, info->driver_data,
++			   size - (int)sizeof(*info));
++		if (ret < 0)
++			return ret;
++		info->len += ret;
++	}
++
++	strlcpy(info->obj_name, fence->ops->get_timeline_name(fence),
++		sizeof(info->obj_name));
++	strlcpy(info->driver_name, driver_name, sizeof(info->driver_name));
++	info->status = dma_fence_get_status(fence);
++	while (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags) &&
++	       !test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &fence->flags))
++		cpu_relax();
++	info->timestamp_ns =
++		test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &fence->flags) ?
++		ktime_to_ns(fence->timestamp) : 0;
++
++	return info->len;
++}
++
++/* As R32's sync_fence_ioctl_fence_info(). */
++static long sync_file_ioctl_fence_info_r32(struct sync_file *sync_file,
++					   unsigned long arg)
++{
++	struct sync_fence_info_data_r32 *data;
++	struct dma_fence **fences;
++	__u32 size, len;
++	int num_fences, ret = 0, i;
++
++	BUILD_BUG_ON(sizeof(struct sync_merge_data_r32) != 40);
++	BUILD_BUG_ON(sizeof(struct sync_pt_info_r32) != 80);
++	BUILD_BUG_ON(sizeof(struct sync_fence_info_data_r32) != 40);
++
++	if (copy_from_user(&size, (void __user *)arg, sizeof(size)))
++		return -EFAULT;
++
++	if (size < sizeof(*data))
++		return -EINVAL;
++
++	if (size > 4096)
++		size = 4096;
++
++	data = kzalloc(size, GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	sync_file_get_name(sync_file, data->name, sizeof(data->name));
++	data->status = dma_fence_get_status(sync_file->fence);
++	len = sizeof(*data);
++
++	fences = get_fences(sync_file, &num_fences);
++	for (i = 0; i < num_fences; i++) {
++		ret = sync_fill_pt_info_r32(fences[i], (u8 *)data + len,
++					    size - len);
++		if (ret < 0)
++			goto out;
++		len += ret;
++	}
++
++	data->len = len;
++	ret = copy_to_user((void __user *)arg, data, len) ? -EFAULT : 0;
++
++out:
++	kfree(data);
++	return ret;
++}
++
+ static long sync_file_ioctl(struct file *file, unsigned int cmd,
+ 			    unsigned long arg)
+ {
+@@ -472,6 +667,15 @@ static long sync_file_ioctl(struct file *file, unsigned int cmd,
+ 	case SYNC_IOC_FILE_INFO:
+ 		return sync_file_ioctl_fence_info(sync_file, arg);
+ 
++	case SYNC_IOC_WAIT_R32:
++		return sync_file_ioctl_wait_r32(sync_file, arg);
++
++	case SYNC_IOC_MERGE_R32:
++		return sync_file_ioctl_merge_r32(sync_file, arg);
++
++	case SYNC_IOC_FENCE_INFO_R32:
++		return sync_file_ioctl_fence_info_r32(sync_file, arg);
++
+ 	default:
+ 		/*
+ 		 * Jetson Nano trial: JetPack 4's userspace was built for
+diff --git a/include/linux/sync_file.h b/include/linux/sync_file.h
+index 790ca02..869a5bc 100644
+--- a/include/linux/sync_file.h
++++ b/include/linux/sync_file.h
+@@ -59,4 +59,15 @@ struct sync_file *sync_file_create(struct dma_fence *fence);
+ struct dma_fence *sync_file_get_fence(int fd);
+ char *sync_file_get_name(struct sync_file *sync_file, char *buf, int len);
+ 
++/*
++ * Jetson Nano trial: a fence driver's part of the fence info that JetPack 4's
++ * (L4T R32) userspace reads through Android's older sync interface. Called for
++ * each fence; for its own fences the driver writes its driver data, may give
++ * its R32 driver name, and returns the number of bytes written.
++ */
++typedef int (*sync_file_r32_pt_fn)(struct dma_fence *fence,
++				   const char **driver_name,
++				   void *data, int size);
++void sync_file_set_r32_pt_fn(sync_file_r32_pt_fn fn);
++
+ #endif /* _LINUX_SYNC_H */
+diff --git a/nvidia/drivers/video/tegra/host/host1x/host1x.c b/nvidia/drivers/video/tegra/host/host1x/host1x.c
+index 1ecc48b..c998b1f 100644
+--- a/nvidia/drivers/video/tegra/host/host1x/host1x.c
++++ b/nvidia/drivers/video/tegra/host/host1x/host1x.c
+@@ -59,6 +59,9 @@
+ #ifdef CONFIG_TEGRA_GRHOST_SYNC
+ #include "nvhost_sync.h"
+ #endif
++#if IS_ENABLED(CONFIG_TEGRA_GRHOST_SYNC) && !IS_ENABLED(CONFIG_SYNC)
++#include "../nvhost_sync_v2.h"
++#endif
+ 
+ #include "nvhost_scale.h"
+ #include "chip_support.h"
+@@ -1412,6 +1415,14 @@ static int nvhost_probe(struct platform_device *dev)
+ 	list_add_tail(&host->list, &nvhost_masters);
+ 	mutex_unlock(&nvhost_masters_lock);
+ 
++#if IS_ENABLED(CONFIG_TEGRA_GRHOST_SYNC) && !IS_ENABLED(CONFIG_SYNC)
++	/*
++	 * Jetson Nano trial: JetPack 4's userspace reads syncpoint fence
++	 * points through Android's older sync interface (patch 0026).
++	 */
++	nvhost_dma_fence_register_r32();
++#endif
++
+ 	dev_info(&dev->dev, "initialized\n");
+ 	return 0;
+ 
+diff --git a/nvidia/drivers/video/tegra/host/nvhost_sync_v2.c b/nvidia/drivers/video/tegra/host/nvhost_sync_v2.c
+index 38cf1bf..c37149b 100644
+--- a/nvidia/drivers/video/tegra/host/nvhost_sync_v2.c
++++ b/nvidia/drivers/video/tegra/host/nvhost_sync_v2.c
+@@ -158,6 +158,41 @@ int nvhost_dma_fence_unpack(struct dma_fence *fence, u32 *id, u32 *threshold)
+ }
+ EXPORT_SYMBOL(nvhost_dma_fence_unpack);
+ 
++/*
++ * Jetson Nano trial: R32's nvhost described each fence point to Android's
++ * sync interface as the timeline driver "nvhost_sync", with its syncpoint id
++ * and threshold as driver data (nvhost_sync_fill_driver_data()). JetPack 4's
++ * userspace reads them back through the older SYNC_IOC_FENCE_INFO request,
++ * which sync_file serves for it (patch 0026).
++ */
++static int nvhost_dma_fence_r32_pt(struct dma_fence *fence,
++				   const char **driver_name,
++				   void *data, int size)
++{
++	struct nvhost_dma_fence *f = to_nvhost_dma_fence(fence);
++	struct nvhost_ctrl_sync_fence_info info;
++
++	if (!f)
++		return 0;
++
++	if (size < (int)sizeof(info)) {
++		pr_err("%s: size %d too small\n", __func__, size);
++		return -ENOMEM;
++	}
++
++	info.id = f->id;
++	info.thresh = f->threshold;
++	memcpy(data, &info, sizeof(info));
++	*driver_name = "nvhost_sync";
++
++	return sizeof(info);
++}
++
++void nvhost_dma_fence_register_r32(void)
++{
++	sync_file_set_r32_pt_fn(nvhost_dma_fence_r32_pt);
++}
++
+ static struct dma_fence *nvhost_dma_fence_create_single(
+ 			struct nvhost_syncpt *syncpt, u32 id, u32 threshold)
+ {
+diff --git a/nvidia/drivers/video/tegra/host/nvhost_sync_v2.h b/nvidia/drivers/video/tegra/host/nvhost_sync_v2.h
+index e07524b..cf69156 100644
+--- a/nvidia/drivers/video/tegra/host/nvhost_sync_v2.h
++++ b/nvidia/drivers/video/tegra/host/nvhost_sync_v2.h
+@@ -23,4 +23,6 @@ struct dma_fence *nvhost_dma_fence_create(
+ 	struct nvhost_syncpt *syncpt, struct nvhost_ctrl_sync_fence_info *pts,
+ 	int num_pts);
+ 
++void nvhost_dma_fence_register_r32(void);
++
+ #endif /* __NVHOST_SYNC_V2_H */

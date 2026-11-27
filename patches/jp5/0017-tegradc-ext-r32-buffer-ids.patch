@@ -1,0 +1,122 @@
+video: tegra: dc: ext: take buffer id 0 as "no buffer", as R32
+
+JetPack 4's X driver shows its screens through tegradc's ext interface,
+whose buffer ids are dma-buf file descriptors. R32's interface uses 0 for
+"no buffer"; R35's uses a negative id, so it looked up file descriptor 0
+for every unused plane and failed the flip.
+
+Take 0 as none too, as R32 did; a negative id still means none. A buffer
+that cannot be pinned now says why (rate limited) where every failure used
+to return only -ENOMEM.
+
+Tested on the Nano: in trial 22 X's flips reached the pin with no "not a
+dma-buf", attach or map failure; from trial 23 its buffers show on screen.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/video/tegra/dc/ext/dev.c b/nvidia/drivers/video/tegra/dc/ext/dev.c
+--- a/nvidia/drivers/video/tegra/dc/ext/dev.c
++++ b/nvidia/drivers/video/tegra/dc/ext/dev.c
+@@ -1414,7 +1414,8 @@ static int sanitize_flip_args(struct tegra_dc_ext_user *user,
+ 		input_h.full = win->h;
+ 		w = dfixed_trunc(input_w);
+ 		h = dfixed_trunc(input_h);
+-		if (win->buff_id >= 0 &&
++		/* A buffer id of 0 is no buffer too (R32, see tegra_dc_ext_pin_window()) */
++		if (win->buff_id > 0 &&
+ 			(w == 0 || h == 0 ||
+ 			win->out_w == 0 || win->out_h == 0)) {
+ 			dev_err(&dc->ndev->dev,
+@@ -1497,7 +1498,8 @@ static int tegra_dc_ext_pin_windows(struct tegra_dc_ext_user *user,
+ 		if (ret)
+ 			return ret;
+ 
+-		if (flip_win->attr.buff_id_u >= 0) {
++		/* 0 is no buffer too (R32, see tegra_dc_ext_pin_window()) */
++		if (flip_win->attr.buff_id_u > 0) {
+ 			ret = tegra_dc_ext_pin_window(user,
+ 					      flip_win->attr.buff_id_u,
+ 					      &flip_win->handle[TEGRA_DC_U],
+@@ -1509,7 +1511,7 @@ static int tegra_dc_ext_pin_windows(struct tegra_dc_ext_user *user,
+ 			flip_win->phys_addr_u = 0;
+ 		}
+ 
+-		if (flip_win->attr.buff_id_v >= 0) {
++		if (flip_win->attr.buff_id_v > 0) {
+ 			ret = tegra_dc_ext_pin_window(user,
+ 					      flip_win->attr.buff_id_v,
+ 					      &flip_win->handle[TEGRA_DC_V],
+@@ -1524,7 +1526,7 @@ static int tegra_dc_ext_pin_windows(struct tegra_dc_ext_user *user,
+ 		if (flip_win->attr.flags & TEGRA_DC_EXT_FLIP_FLAG_COMPRESSED) {
+ 			/* use buff_id of the main surface when the cde one is invalid */
+ 			__s32 cde_buff_id = flip_win->attr.cde.buff_id;
+-			if (cde_buff_id < 0)
++			if (cde_buff_id <= 0)
+ 				cde_buff_id = flip_win->attr.buff_id;
+ 			ret = tegra_dc_ext_pin_window(user,
+ 					      cde_buff_id,
+@@ -2505,7 +2507,7 @@ static int tegra_dc_ext_negotiate_bw(struct tegra_dc_ext_user *user,
+ 
+ 		idx = wins[i].index;
+ 
+-		if (wins[i].buff_id >= 0) {
++		if (wins[i].buff_id > 0) {
+ 			tegra_dc_ext_set_windowattr_basic(&dc->tmp_wins[idx],
+ 							  &wins[i]);
+ 		} else {
+diff --git a/nvidia/drivers/video/tegra/dc/ext/util.c b/nvidia/drivers/video/tegra/dc/ext/util.c
+--- a/nvidia/drivers/video/tegra/dc/ext/util.c
++++ b/nvidia/drivers/video/tegra/dc/ext/util.c
+@@ -36,7 +36,11 @@ int tegra_dc_ext_pin_window(struct tegra_dc_ext_user *user, s32 fd,
+ 
+ 	*dc_buf = NULL;
+ 	*phys_addr = -1;
+-	if (fd < 0)
++	/*
++	 * R32's interface, which JetPack 4's Xorg driver uses, passes 0 for no
++	 * buffer; R35 made the ids signed and passes a negative one. Take both.
++	 */
++	if (fd <= 0)
+ 		return 0;
+ 
+ 	dc_dmabuf = kzalloc(sizeof(*dc_dmabuf), GFP_KERNEL);
+@@ -44,17 +48,23 @@ int tegra_dc_ext_pin_window(struct tegra_dc_ext_user *user, s32 fd,
+ 		return -ENOMEM;
+ 
+ 	dc_dmabuf->buf = dma_buf_get(fd);
+-	if (IS_ERR_OR_NULL(dc_dmabuf->buf))
++	if (IS_ERR_OR_NULL(dc_dmabuf->buf)) {
++		dev_err_ratelimited(parent, "fd %d is not a dma-buf\n", fd);
+ 		goto buf_fail;
++	}
+ 
+ 	dc_dmabuf->attach = dma_buf_attach(dc_dmabuf->buf, parent);
+-	if (IS_ERR_OR_NULL(dc_dmabuf->attach))
++	if (IS_ERR_OR_NULL(dc_dmabuf->attach)) {
++		dev_err_ratelimited(parent, "cannot attach fd %d\n", fd);
+ 		goto attach_fail;
++	}
+ 
+ 	dc_dmabuf->sgt = dma_buf_map_attachment(dc_dmabuf->attach,
+ 						DMA_TO_DEVICE);
+-	if (IS_ERR_OR_NULL(dc_dmabuf->sgt))
++	if (IS_ERR_OR_NULL(dc_dmabuf->sgt)) {
++		dev_err_ratelimited(parent, "cannot map fd %d\n", fd);
+ 		goto sgt_fail;
++	}
+ 
+ #if KERNEL_VERSION(5, 4, 0) < LINUX_VERSION_CODE
+ 	if (!iommu_get_domain_for_dev(&ext->dc->ndev->dev)) {
+@@ -62,8 +72,10 @@ int tegra_dc_ext_pin_window(struct tegra_dc_ext_user *user, s32 fd,
+ 	if (parent->archdata.iommu == NULL) {
+ #endif
+ 		if(sg_nents(dc_dmabuf->sgt->sgl) > 1) {
+-			dev_err(ext->dev->parent,
+-				"Cannot use non-contiguous buffer w/ IOMMU disabled\n");
++			dev_err_ratelimited(ext->dev->parent,
++				"Cannot use non-contiguous buffer w/ IOMMU disabled (fd %d, %d entries, %zu bytes)\n",
++				fd, sg_nents(dc_dmabuf->sgt->sgl),
++				dc_dmabuf->buf->size);
+ 			goto iommu_fail;
+ 		} else {
+ 			*phys_addr = sg_phys(dc_dmabuf->sgt->sgl);

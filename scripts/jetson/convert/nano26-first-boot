@@ -1,0 +1,260 @@
+#!/bin/bash
+# nano26-first-boot: the new card's first boot (docs/CONVERTER.md).
+#
+# nano26-convert installs this as /usr/lib/nano26/first-boot and boots it as
+# PID 1 (init= in the new card's first extlinux.conf), on JetPack 5's 5.10
+# kernel. First it grows APP and its ext4 to the end of the card: the image
+# the converter writes is only as large as its contents. The converter itself
+# runs on JetPack 4's 4.9 kernel, where Ubuntu
+# 26.04's systemd 259 is not supported (it needs Linux 5.4 or newer), so it
+# only downloads the packages. This script installs them here, offline from
+# the card's cache, as build-u26-root.sh did for the reference card on 5.10; then it
+# applies what the converter staged in /var/lib/nano26: the Wi-Fi firmware,
+# the accounts, the time zone and the locale. It enables nano26-stage2.service,
+# which builds and installs the GPU stack on the next boot. Last it switches
+# extlinux.conf to the everyday entry and restarts into Ubuntu 26.04's own
+# systemd.
+#
+# Every step can run again. If one fails, the screen and
+# /var/log/nano26/first-boot.log say which, and powering on again retries.
+# Outside PID 1 (a test in a chroot) it does the same but neither mounts
+# anything, grows the card nor restarts.
+set -u
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root TERM=linux DEBIAN_FRONTEND=noninteractive
+state=/var/lib/nano26
+log=/var/log/nano26/first-boot.log
+pid1=0
+[ "$$" = 1 ] && pid1=1
+
+if [ $pid1 = 1 ]; then
+    # Nothing may write to /dev before devtmpfs is there, or it would land on
+    # the root filesystem.
+    mountpoint -q /proc || mount -t proc proc /proc
+    mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+    mountpoint -q /sys || mount -t sysfs sysfs /sys
+    mkdir -p /dev/pts /dev/shm
+    mountpoint -q /dev/pts || mount -t devpts -o gid=5,mode=620 devpts /dev/pts
+    mountpoint -q /dev/shm || mount -t tmpfs -o nosuid,nodev tmpfs /dev/shm
+    mountpoint -q /run || mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run
+    mount -o remount,rw /
+fi
+mkdir -p /var/log/nano26
+
+say() {
+    printf '%s nano26 first boot: %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$log"
+}
+
+fail() {
+    say "FAILED: $*"
+    say 'The log is /var/log/nano26/first-boot.log on this card. Power off and on'
+    say 'again to retry, or put the JetPack 4 card back.'
+    sync
+    if [ $pid1 = 1 ]; then
+        while :; do sleep 3600; done
+    fi
+    exit 1
+}
+
+# A command's output goes to the log; on failure its last lines also show.
+run() {
+    printf '$ %s\n' "$*" >> "$log"
+    "$@" >> "$log" 2>&1 || { tail -n 20 "$log"; fail "$*"; }
+}
+
+setting() { sed -n "s/^$1=//p" "$state/settings"; }
+
+# APP ends the card (the converter checked that on the JetPack 4 card), so it
+# can grow up to the backup GPT in the card's last 33 sectors. An image ends
+# a little after its contents; a card written directly is already full, and
+# then only resize2fs runs, which finds nothing to do.
+grow_root() {
+    local dev disk n start size total min p
+    dev=$(readlink -f "/sys/dev/block/$(mountpoint -d /)")
+    [ -f "$dev/partition" ] || fail "the root ($dev) is not a partition of the card"
+    disk=$(basename "$(dirname "$dev")")
+    n=$(cat "$dev/partition")
+    start=$(cat "$dev/start")
+    size=$(cat "$dev/size")
+    total=$(cat "/sys/block/$disk/size")
+    min=$(setting card-min)
+    [ $((total * 512)) -ge "${min:-0}" ] || fail "this card has $((total * 512 / 1000000000)) GB;" \
+        "Ubuntu 26.04 with the GPU stack needs one of $((min / 1000000000)) GB or more (a 32 GB card)"
+    for p in /sys/block/"$disk"/*/partition; do
+        [ "$(cat "${p%/partition}/start")" -le "$start" ] || fail "a partition follows the root on /dev/$disk"
+    done
+    if [ $((total - 34 - start - size)) -ge 2048 ]; then
+        say "growing the root to the end of the card ($((total * 512 / 1000000000)) GB)"
+        run apt-get --no-download --yes --no-install-recommends -o Dpkg::Options::=--force-confold install fdisk
+        run sfdisk --no-reread --no-tell-kernel -N "$n" "/dev/$disk" <<< ', +'
+        run partx --update --nr "$n" "/dev/$disk"
+    fi
+    run resize2fs "/dev/${dev##*/}"
+    say "the root has $(df -h --output=size / | tail -n 1 | tr -d ' ')"
+}
+
+say "starting on $(uname -r)"
+[ -f "$state/packages" ] || fail "$state/packages is missing: this card was not written by nano26-convert"
+# The Nano has no clock battery: start no earlier than the card was written.
+written=$(cat "$state/written-at")
+if [ "$(date +%s)" -lt "$written" ]; then
+    date -s "@$written" > /dev/null
+fi
+# So does every later boot until timesyncd has the network's time: systemd
+# moves the clock forward to this file's time (otherwise to its own build
+# date; stage 2 started a month early on the Nano, 2026-10-22).
+touch /usr/lib/clock-epoch
+
+run dpkg --configure -a
+if [ $pid1 = 1 ]; then
+    grow_root
+fi
+
+say "installing Ubuntu 26.04's packages from the card, the desktops among them (a long while, no network)"
+run apt-get --no-download --yes -o Dpkg::Options::=--force-confold full-upgrade
+mapfile -t packages < "$state/packages"
+run apt-get --no-download --yes --no-install-recommends -o Dpkg::Options::=--force-confold \
+    install "${packages[@]}"
+version=$(systemctl --version | head -n 1)
+case $version in
+    'systemd 259'*) ;;
+    *) fail "systemd is '$version', not 259" ;;
+esac
+
+say 'uncompressing the Wi-Fi firmware for the 5.10 kernel'
+# Python's tarfile rather than dpkg-deb --extract: that runs 26.04's tar,
+# which fails on kernels or emulators without a newer system call (found on
+# 4.9, 2026-10-12). A link that matches (Ubuntu keeps the Intel
+# names as links into intel/iwlwifi/) brings its target along.
+printf '$ firmware from %s\n' "$state"/firmware/*.deb >> "$log"
+count=$(python3 -I - "$state/firmware-patterns" "$state"/firmware/*.deb 2>> "$log" <<'PY'
+import fnmatch, os, posixpath, subprocess, sys, tarfile
+
+patterns = open(sys.argv[1]).read().split()
+prefix = 'usr/lib/firmware/'
+tmp = '/var/tmp/nano26-firmware.tar'
+count = 0
+
+
+def plain(rel):
+    return rel[:-4] if rel.endswith('.zst') else rel
+
+
+for deb in sys.argv[2:]:
+    with open(tmp, 'wb') as out:
+        subprocess.run(['dpkg-deb', '--fsys-tarfile', deb], stdout=out, check=True)
+    with tarfile.open(tmp) as tar:
+        members = {}
+        for m in tar.getmembers():
+            name = posixpath.normpath(m.name)
+            if name.startswith(prefix):
+                members[name[len(prefix):]] = m
+        todo = [rel for rel in members if any(fnmatch.fnmatch(plain(rel), p) for p in patterns)]
+        chosen = set()
+        while todo:
+            rel = todo.pop()
+            if rel in chosen or rel not in members:
+                continue
+            chosen.add(rel)
+            if members[rel].issym():
+                todo.append(posixpath.normpath(posixpath.join(posixpath.dirname(rel), members[rel].linkname)))
+        for rel in sorted(chosen):
+            m = members[rel]
+            dest = '/' + prefix + plain(rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if m.issym():
+                if os.path.lexists(dest):
+                    os.unlink(dest)
+                os.symlink(plain(m.linkname), dest)
+            elif m.isfile():
+                data = tar.extractfile(m).read()
+                if rel.endswith('.zst'):
+                    data = subprocess.run(['zstd', '-q', '-d', '-c'], input=data, stdout=subprocess.PIPE,
+                                          check=True).stdout
+                with open(dest + '.new', 'wb') as f:
+                    f.write(data)
+                os.chmod(dest + '.new', 0o644)
+                os.replace(dest + '.new', dest)
+            else:
+                continue
+            print('firmware %s' % plain(rel), file=sys.stderr)
+            count += 1
+    os.unlink(tmp)
+print(count)
+PY
+) || { tail -n 20 "$log"; fail 'could not uncompress the Wi-Fi firmware'; }
+[ "${count:-0}" -gt 0 ] || fail 'no Wi-Fi firmware matched'
+say "$count firmware files in place"
+
+say 'creating the accounts'
+users=0
+while IFS=: read -r user uid gid group gecos home groups; do
+    getent group "$gid" > /dev/null || run groupadd --gid "$gid" "$group"
+    have=
+    for g in ${groups//,/ }; do
+        getent group "$g" > /dev/null && have+=$g,
+    done
+    if id -u "$user" > /dev/null 2>&1; then
+        run usermod --groups "${have%,}" "$user"
+    else
+        run useradd --uid "$uid" --gid "$gid" --comment "$gecos" --home-dir "$home" \
+            --shell /bin/bash --create-home --groups "${have%,}" "$user"
+    fi
+    if [ -f "$state/identity/keys/$user" ]; then
+        run install -d -m 0700 -o "$uid" -g "$gid" "$home/.ssh"
+        run install -m 0600 -o "$uid" -g "$gid" "$state/identity/keys/$user" "$home/.ssh/authorized_keys"
+    fi
+    say "account $user, groups ${have%,}"
+    users=$((users + 1))
+done < "$state/identity/accounts"
+[ "$users" -gt 0 ] || fail 'no account to create: this card would have no login'
+if [ -s "$state/identity/shadow" ]; then
+    run chpasswd --encrypted < "$state/identity/shadow"
+fi
+
+say 'time zone, locale and system settings'
+zone=$(setting zone)
+[ -f "/usr/share/zoneinfo/$zone" ] || zone=Etc/UTC
+ln -sfn "/usr/share/zoneinfo/$zone" /etc/localtime
+printf '%s\n' "$zone" > /etc/timezone
+: > /etc/default/locale.new
+while IFS= read -r line; do
+    key=${line%%=*}
+    value=${line#*=}
+    if [ "$value" != C.UTF-8 ]; then
+        run localedef -i "${value%.UTF-8}" -f UTF-8 "$value"
+    fi
+    printf '%s="%s"\n' "$key" "$value" >> /etc/default/locale.new
+done < <(setting locale)
+grep -q '^LANG=' /etc/default/locale.new || printf 'LANG="C.UTF-8"\n' >> /etc/default/locale.new
+mv -f /etc/default/locale.new /etc/default/locale
+[ -s /etc/machine-id ] || run systemd-machine-id-setup
+# A persistent journal, so a failed boot can be read afterwards.
+run install -d -m 2755 -o root -g systemd-journal /var/log/journal
+run systemctl set-default multi-user.target
+# Stage 2 sets graphical.target itself once the GPU stack passes.
+if [ -f /etc/systemd/system/nano26-stage2.service ]; then
+    run systemctl enable nano26-stage2.service
+fi
+say "time zone $zone, $(grep '^LANG=' /etc/default/locale)"
+
+say 'finishing'
+[ -z "$(dpkg --audit)" ] || fail 'dpkg --audit reports unfinished packages'
+rm -f /usr/sbin/policy-rc.d
+run apt-get clean
+conf=/boot/extlinux/extlinux.conf
+{ cp "$state/extlinux.conf" "$conf.next" && sync && mv -f "$conf.next" "$conf" && sync; } \
+    || fail 'could not switch extlinux.conf to the everyday entry'
+# Only now, so a retry still has them: the staged password hashes and keys.
+rm -rf "$state/identity" "$state/firmware"
+date -u +%Y-%m-%dT%H:%M:%SZ > "$state/first-boot.done"
+sync
+say 'NANO26_FIRST_BOOT=DONE'
+if [ $pid1 = 1 ]; then
+    say 'restarting into Ubuntu 26.04; stage 2 then builds the GPU stack'
+    mount -o remount,ro / 2> /dev/null
+    sync
+    echo b > /proc/sysrq-trigger
+    sleep 10
+    systemctl --force --force reboot
+fi
+exit 0

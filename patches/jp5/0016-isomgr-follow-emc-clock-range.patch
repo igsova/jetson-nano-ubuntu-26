@@ -1,0 +1,129 @@
+platform/tegra: isomgr: follow the EMC clock's range
+
+The isochronous bandwidth manager sizes its pool once, at init, from the
+bandwidth manager's top memory rate. On 5.10 that is still the 204 MHz
+boot rate at that moment (see 0010), so the pool was too small and the
+HDMI head's reservation was refused.
+
+Export 0010's range update from bwmgr and call it before sizing the pool,
+and before each register and reserve, growing the pool when the range has
+grown.
+
+Found: trial 20. Tested on the Nano: in trial 21 isomgr read 1600 MHz and
+the same pool as 4.9 (11,520,000 KB), and the HDMI head reserved its
+bandwidth.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/platform/tegra/mc/emc_bwmgr.c b/nvidia/drivers/platform/tegra/mc/emc_bwmgr.c
+--- a/nvidia/drivers/platform/tegra/mc/emc_bwmgr.c
++++ b/nvidia/drivers/platform/tegra/mc/emc_bwmgr.c
+@@ -466,6 +466,19 @@ unsigned long tegra_bwmgr_get_max_emc_rate(void)
+ }
+ EXPORT_SYMBOL_GPL(tegra_bwmgr_get_max_emc_rate);
+ 
++/*
++ * Pick up an EMC rate range that grew since the last update, for callers
++ * that size things from tegra_bwmgr_get_max_emc_rate() (isomgr).
++ */
++void tegra_bwmgr_update_emc_range(void)
++{
++	if (bwmgr_disable || !bwmgr_lock())
++		return;
++	bwmgr_update_rate_range();
++	bwmgr_unlock();
++}
++EXPORT_SYMBOL_GPL(tegra_bwmgr_update_emc_range);
++
+ /* Returns the ratio between dram and emc freq based on the type of dram */
+ int bwmgr_get_emc_to_dram_freq_factor(void)
+ {
+diff --git a/nvidia/drivers/platform/tegra/mc/isomgr-pre_t19x.c b/nvidia/drivers/platform/tegra/mc/isomgr-pre_t19x.c
+--- a/nvidia/drivers/platform/tegra/mc/isomgr-pre_t19x.c
++++ b/nvidia/drivers/platform/tegra/mc/isomgr-pre_t19x.c
+@@ -335,6 +335,36 @@ static struct isoclient_info *get_iso_client_info(int *length)
+ 	return cinfo;
+ }
+ 
++#ifdef CONFIG_COMMON_CLK
++/*
++ * On 5.10 isomgr_init() runs at device_initcall_sync, and on Tegra210 bwmgr can
++ * still hold the EMC clock's boot rate as its maximum then: it widens its range
++ * on its next update after the EMC driver attaches the full table. That sized
++ * the pool at 204 MHz, 1468800 KB, too little for one 1080p head (2400960 KB),
++ * where 4.9 had 11520000 KB at 1600 MHz. Grow the pool when the range grows.
++ * Call with isomgr lock held (or from init).
++ */
++static void pre_t19x_iso_update_max(void)
++{
++	unsigned int max_emc_clk;
++	unsigned int max_iso_bw;
++
++	tegra_bwmgr_update_emc_range();
++	max_emc_clk = tegra_bwmgr_get_max_emc_rate() / 1000;
++	max_iso_bw = bwmgr_freq_to_bw(max_emc_clk) *
++		bwmgr_iso_bw_percentage_max() / 100;
++	if (!isomgr.max_iso_bw || max_iso_bw <= isomgr.max_iso_bw)
++		return;
++
++	isomgr.avail_bw += max_iso_bw - isomgr.max_iso_bw;
++	isomgr.max_iso_bw = max_iso_bw;
++	pr_info("iso emc max clk now %uKHz, max_iso_bw=%uKB\n",
++		max_emc_clk, isomgr.max_iso_bw);
++}
++#else
++static inline void pre_t19x_iso_update_max(void) {}
++#endif
++
+ static void pre_t19x_iso_plat_init(void)
+ {
+ 	unsigned int max_emc_clk;
+@@ -342,6 +372,7 @@ static void pre_t19x_iso_plat_init(void)
+ 
+ 	if (!isomgr.max_iso_bw) {
+ #ifdef CONFIG_COMMON_CLK
++		tegra_bwmgr_update_emc_range();
+ 		max_emc_clk = tegra_bwmgr_get_max_emc_rate() / 1000;
+ 		max_emc_bw = bwmgr_freq_to_bw(max_emc_clk);
+ 		isomgr.max_iso_bw = max_emc_bw *
+@@ -377,6 +408,7 @@ static bool pre_t19x_iso_plat_reserve(struct isomgr_client *cp, u32 bw,
+ 	u64 bw_check;
+ 	u32 max_emc_bw;
+ 
++	pre_t19x_iso_update_max();
+ 	if (bw <= cp->margin_bw)
+ 		goto bw_limit_check;
+ 
+@@ -456,6 +488,7 @@ static bool pre_t19x_iso_plat_realize(struct isomgr_client *cp)
+ 
+ static bool pre_t19x_iso_plat_register(u32 dedi_bw, enum tegra_iso_client client)
+ {
++	pre_t19x_iso_update_max();
+ 	if (unlikely(dedi_bw > isomgr.max_iso_bw - isomgr.dedi_bw)) {
+ 		pr_err("iso bandwidth %uKB is not available, client %s\n",
+ 			dedi_bw, cname[client]);
+diff --git a/nvidia/include/linux/platform/tegra/emc_bwmgr.h b/nvidia/include/linux/platform/tegra/emc_bwmgr.h
+--- a/nvidia/include/linux/platform/tegra/emc_bwmgr.h
++++ b/nvidia/include/linux/platform/tegra/emc_bwmgr.h
+@@ -185,6 +185,12 @@ unsigned long tegra_bwmgr_get_emc_rate(void);
+  */
+ unsigned long tegra_bwmgr_get_max_emc_rate(void);
+ 
++/**
++ * tegra_bwmgr_update_emc_range - widen the EMC rate range if the EMC clock
++ *			now offers more than when it was last read.
++ */
++void tegra_bwmgr_update_emc_range(void);
++
+ /**
+  * tegra_bwmgr_get_core_emc_rate - get the actual emc frequency calculated
+  *			using the dram frequency and emc_to_dram
+@@ -338,6 +344,8 @@ static inline unsigned long tegra_bwmgr_get_max_emc_rate(void)
+ 	return clk_round_rate(bwmgr_emc_clk, LONG_MAX);
+ }
+ 
++static inline void tegra_bwmgr_update_emc_range(void) {}
++
+ static inline unsigned long tegra_bwmgr_get_core_emc_rate(void)
+ {
+ 	return 0;

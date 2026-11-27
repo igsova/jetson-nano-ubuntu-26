@@ -1,0 +1,4 @@
+libcudla.so.1 {
+    global: cudla*;
+    local: *;
+};

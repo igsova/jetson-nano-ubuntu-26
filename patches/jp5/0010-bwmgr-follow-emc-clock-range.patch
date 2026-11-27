@@ -1,0 +1,89 @@
+platform/tegra: bwmgr: follow the EMC clock's range
+
+R35's bandwidth manager drives the memory clock from its clients' requests
+(the GPU, SD card, USB, PCIe). It reads the clock's range once, at init,
+but drivers/platform links before drivers/memory, so the EMC driver has not
+attached its table yet and the range is 204 MHz alone. Every later request
+was then capped there.
+
+Re-read the range before handling a request, widen it once the clock
+offers more, and lift client caps left at the old maximum.
+
+Tested on the Nano: trial 13 logged "bwmgr: emc rate range now
+204000000-1600000000 Hz", and requests then rounded to 1600 MHz.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/platform/tegra/mc/emc_bwmgr.c b/nvidia/drivers/platform/tegra/mc/emc_bwmgr.c
+index cc6efb31a..7954b2f3e 100644
+--- a/nvidia/drivers/platform/tegra/mc/emc_bwmgr.c
++++ b/nvidia/drivers/platform/tegra/mc/emc_bwmgr.c
+@@ -233,6 +233,43 @@ static unsigned long tegra_bwmgr_apply_efficiency(
+ 			iso_bw_nvdis, iso_bw_vi);
+ }
+ 
++/*
++ * bwmgr_init() reads the EMC clock's range once, but on Tegra210 the EMC
++ * driver attaches its timing table to that clock later (drivers/memory links
++ * after drivers/platform), so the range read then is the boot rate alone, and
++ * every update capped the EMC clock there. Widen the range once the clock
++ * offers more, and lift caps that were left at the old maximum.
++ * Call with bwmgr lock held.
++ */
++static void bwmgr_update_rate_range(void)
++{
++	unsigned long old_max = bwmgr.emc_max_rate;
++	long min_rate, max_rate;
++	int i;
++
++	if (!bwmgr.emc_clk)
++		return;
++
++	max_rate = clk_round_rate(bwmgr.emc_clk, LONG_MAX);
++	if (max_rate <= 0 || (unsigned long)max_rate <= old_max)
++		return;
++
++	min_rate = clk_round_rate(bwmgr.emc_clk, 0);
++	if (min_rate >= 0)
++		bwmgr.emc_min_rate = min_rate;
++	bwmgr.emc_max_rate = max_rate;
++
++	for (i = 0; i < TEGRA_BWMGR_CLIENT_COUNT; i++) {
++		if (bwmgr.bwmgr_client[i].cap == old_max)
++			bwmgr.bwmgr_client[i].cap = max_rate;
++		if (bwmgr.bwmgr_client[i].iso_cap == old_max)
++			bwmgr.bwmgr_client[i].iso_cap = max_rate;
++	}
++
++	pr_info("bwmgr: emc rate range now %lu-%lu Hz\n",
++		bwmgr.emc_min_rate, bwmgr.emc_max_rate);
++}
++
+ /* call with bwmgr lock held */
+ static int bwmgr_update_clk(void)
+ {
+@@ -502,6 +539,8 @@ int tegra_bwmgr_set_emc(struct tegra_bwmgr_client *handle, unsigned long val,
+ 		return -EINVAL;
+ 	}
+ 
++	bwmgr_update_rate_range();
++
+ #ifdef CONFIG_TRACEPOINTS
+ 	trace_tegra_bwmgr_set_emc(
+ 			tegra_bwmgr_client_names[handle - bwmgr.bwmgr_client],
+@@ -817,6 +856,7 @@ static int tegra_bwmgr_update_efficiency(unsigned long cur_state,
+ 	if (bwmgr.ops->update_efficiency)
+ 		bwmgr.ops->update_efficiency(cur_state);
+ 
++	bwmgr_update_rate_range();
+ 	if (!clk_update_disabled)
+ 		ret = bwmgr_update_clk();
+ 
+@@ -1081,6 +1121,7 @@ static int bwmgr_debugfs_emc_rate_set(void *data, u64 val)
+ 
+ 	if (val == 0) {
+ 		bwmgr.override = false;
++		bwmgr_update_rate_range();
+ 		bwmgr_update_clk();
+ 	} else if (bwmgr.emc_clk) {
+ 		bwmgr.override = true;

@@ -1,0 +1,37 @@
+nvgpu: gm20b: small pages when the GPU has no IOMMU
+
+The Nano's device tree for 5.10 leaves out NVIDIA's downstream SMMU, which
+5.10 has no driver for, so the GPU uses direct DMA. nvgpu's big pages need
+contiguous I/O addresses, which direct DMA cannot promise. Turn big pages
+off on gm20b when the GPU has no IOMMU domain, as R35's gv11b platform
+already does.
+
+Tested on the Nano: CUDA 10.2 passed every test under 5.10 in trial 11.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c
+index de6ac5b78..504c51ac7 100644
+--- a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c
++++ b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c
+@@ -21,6 +21,7 @@
+ #include <uapi/linux/nvgpu.h>
+ #include <linux/dma-buf.h>
+ #include <linux/reset.h>
++#include <linux/iommu.h>
+ #include <nvgpu/vpr.h>
+ 
+ #if defined(CONFIG_TEGRA_DVFS)
+@@ -890,6 +891,12 @@ static int gk20a_tegra_probe(struct device *dev)
+ 		return ret;
+ #endif
+ 
++	/*
++	 * Big pages need contiguous IOVA from the SMMU. Without an IOMMU
++	 * domain, map with small pages, as the gv11b platform does.
++	 */
++	platform->disable_bigpage = !iommu_get_domain_for_dev(dev);
++
+ #ifdef CONFIG_OF
+ 	of_chosen = of_find_node_by_path("/chosen");
+ 	if (!of_chosen)

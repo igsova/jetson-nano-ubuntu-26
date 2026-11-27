@@ -1,0 +1,1793 @@
+#!/usr/bin/env python3
+"""Turn a Jetson Nano's JetPack 4.6.6 card into Ubuntu 26.04 on JetPack 5's
+5.10 kernel: an image file to write over that card, or a second card
+(docs/CONVERTER.md).
+
+The new card boots Ubuntu 26.04 with its own systemd, SSH, the network
+profiles and the accounts copied from this system; on its first boot with
+systemd it builds and installs the GPU stack the reference card runs (JetPack 5's driver
+set with CUDA 11.4, cuDNN 8.6 and TensorRT 8.5, CUDA 12.6 with cuDNN 9,
+JetPack 4's TensorRT 8.2, both video converters) and the desktops, checks
+them and restarts into the desktop's login screen.
+
+Usage, on the Nano, booted from NVIDIA's JetPack 4.6.6 card:
+    sudo ./nano26-convert --target-image ~/nano26.img [--kernel DIR] [--dry-run]
+or with a second card in a USB card reader:
+    sudo ./nano26-convert --list
+    sudo ./nano26-convert --target /dev/sdX [--kernel DIR] [--dry-run] [--offline]
+
+Checks, each a line, then NANO26_CHECKS=PASS or FAIL:
+  root       running as root (the source card's table needs it);
+  board      a Nano 4GB SD developer kit on the B01 carrier, the only board
+             this project has tested (device tree compatible);
+  l4t        L4T R32.7.6 (JetPack 4.6.6), with NVIDIA's bootloader package
+             at 32.7.6, so the board's boot firmware is the one tested;
+  boot       the running system's root is the SD card's APP (mmcblk0p1);
+  source     the SD card's GPT: 14 partitions, APP first by number and last
+             on the card, the 13 boot partitions before it;
+  target     a whole USB disk, not the boot card, with nothing mounted or in
+             use, 512-byte sectors and at least MIN_TARGET bytes; or a new
+             image file, in a folder with IMAGE_WORK_MIN free to build it in
+             besides IMAGE_RESERVE for this system (--size sets that working
+             size; by default all the free space up to IMAGE_WORK_MAX);
+  kernel     the 5.10 kernel folder (--kernel; build-jp5-kernel.sh's out/):
+             every file matches its SHA256SUMS, Image is KERNEL_RELEASE, and
+             the Nano B01 device tree and the modules with nvgpu are there.
+             Without --kernel, once KERNEL_BUNDLE_SHA256 is pinned, the
+             published download, fetched when writing, checked against that
+             SHA-256, unpacked in /var/tmp and checked the same way; until
+             then --kernel is needed to write;
+  helpers    nano26-first-boot beside this script, and JetPack 4's USB 3
+             firmware, which the new card's initrd carries;
+  stage2     nano26-stage2 and its unit beside this script, and the
+             repository files stage 2 runs (REPO_FILES): this script must
+             run from a copy of the whole repository;
+  nvidia-key gpg and gpgv, and JetPack 4's copy of NVIDIA's apt key with
+             the fingerprint fetch-r35-cuda.py pins;
+  accounts   at least one account to copy, so the new card has a login;
+  clock      the date is 2026 or later (apt checks signature dates);
+  network    the download hosts answer over HTTPS (skipped with --offline).
+The plan then lists the new card's layout, what is downloaded and from
+where, and what is copied from this system (network names are counted,
+never printed).
+
+Writing, after the user accepts NVIDIA's terms and types the target's name
+(or passes --accept-nvidia-licences and --confirm NAME):
+  1. the new card's GPT: the 13 boot partitions copied from the running card
+     and read back, and APP from the same start to the card's end (for an
+     image, to the end of the working size), formatted ext4 with the running
+     APP's features, which U-Boot reads;
+  2. Ubuntu Base 26.04.1, checked against its pinned SHA-256;
+  3. Ubuntu 26.04's packages and Wi-Fi firmware, downloaded only, by 26.04's
+     apt in a chroot, in one request: the boot packages and stage 2's (the
+     desktops, GCC 11 and what the GPU stack needs from Ubuntu). apt and
+     dpkg run on JetPack 4's 4.9 kernel (shown 2026-10-11), but systemd
+     259 needs Linux 5.4 or newer, so nothing is installed here;
+  4. NVIDIA's packages for stage 2 and Ubuntu 20.04's X server, in a copy of
+     the repositories on the new card (/var/lib/nano26/mirror): NVIDIA's
+     signed indexes checked by fetch-r35-cuda.py's and fetch-cuda12-probe.py's
+     code against the keys they pin, then each package against its index
+     entry and, where this repository pins one, its SHA-256;
+  5. the kernel, its device tree, an initrd with the USB 3 firmware, the
+     modules, and an extlinux.conf whose one entry boots nano26-first-boot
+     as init; and stage 2 with the repository files it runs. On the new
+     card's first boot nano26-first-boot installs the packages on 5.10,
+     creates the accounts, switches extlinux.conf to the everyday entry (the
+     same without init=) and restarts; on the next, nano26-stage2 runs as a
+     systemd service (docs/CONVERTER.md, Stage 2);
+  6. what is copied from this system: the SSH host keys, the hostname and
+     the NetworkManager profiles (each skippable with --no-copy-...), and
+     the accounts with their password hashes, groups and SSH authorized
+     keys, the time zone and the locale, staged in /var/lib/nano26 for the
+     first boot, which deletes the staged copies when it is done. Stage 2
+     builds and checks as the account that ran sudo (else the first);
+  7. for an image: APP's ext4 shrunk to its contents and IMAGE_ROOM, the file
+     cut after it and the GPT written again with its backup at the new end,
+     so the image fits any card of MIN_TARGET bytes; its SHA-256 beside it
+     in FILE.sha256, both for the account that ran sudo only (the image holds
+     the password hashes, SSH keys and network profiles). A failed run
+     deletes the unfinished image. The first boot grows APP and its ext4 to
+     the end of the card the image is written to.
+The last line is NANO26_CONVERT=DONE or FAIL.
+
+The target is never guessed: --target names it, it is checked again just
+before writing, and only it is written. Serial numbers are not read. The
+board's boot firmware and the running card are never written.
+
+The record goes to /var/log/nano26-convert/<stamp> as root, else to
+~/.cache/nano26-convert/<stamp>; it holds this output and every command's.
+
+Testing on another computer: --root DIR reads /proc, /sys, /etc and
+/var/lib/dpkg from a stand-in tree, and --source-disk FILE reads the source
+card from an image file; with --root, a device target is only checked,
+never written; --nvidia-test-plan FILE (only with --root) names stand-ins
+for NVIDIA's servers, keys and pins. Written for the Python 3.6 of JetPack
+4's Ubuntu 18.04.
+"""
+import argparse
+import contextlib
+import hashlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+import zlib
+
+COMPATIBLE = 'nvidia,p3449-0000-b00+p3448-0000-b00'
+L4T_RELEASE = ('32', '7.6')
+BOOTLOADER_PACKAGE = 'nvidia-l4t-bootloader'
+SOURCE_DISK = 'mmcblk0'
+SECTOR = 512
+MIN_TARGET = 30 * 10 ** 9            # a nominal 32 GB card; 64 GB is safer (estimate)
+TIGHT_TARGET = 60 * 10 ** 9
+# An image is built in a sparse file of the working size, then cut to its
+# contents; the first boot grows it to the card's end.
+IMAGE_WORK_MIN = 10 * 10 ** 9        # the working size it needs (estimate: it holds about 6 GB)
+IMAGE_WORK_MAX = 16 * 2 ** 30        # beyond this a larger working size only spreads the files
+IMAGE_RESERVE = 2 ** 30              # left free on the card it is built on
+IMAGE_ROOM = 256 * 2 ** 20           # free in the cut image's APP for the first boot, before it grows
+HOSTS = [
+    ('Ubuntu images', 'https://cdimage.ubuntu.com/'),
+    ('Ubuntu packages', 'https://ports.ubuntu.com/'),
+    ('NVIDIA Jetson packages', 'https://repo.download.nvidia.com/jetson/'),
+    ('NVIDIA CUDA packages', 'https://developer.download.nvidia.com/compute/cuda/repos/'),
+    ('kernel release', 'https://github.com/'),
+]
+DOWNLOADS = [  # what, host, downloaded by this version
+    ('Ubuntu Base 26.04.1 (arm64), checked against its pinned SHA-256', 'cdimage.ubuntu.com', True),
+    ('Ubuntu 26.04 packages: systemd, NetworkManager, OpenSSH and tools', 'ports.ubuntu.com', True),
+    ('Ubuntu 26.04 Wi-Fi firmware: Realtek and Intel', 'ports.ubuntu.com', True),
+    ('Ubuntu 26.04 desktops (Xfce, Unity) and GCC 11; Ubuntu 20.04\'s X server 1.20', 'ports.ubuntu.com', True),
+    ('JetPack 5 (L4T R35.6): GPU driver set, CUDA 11.4, cuDNN 8.6, TensorRT 8.5', 'repo.download.nvidia.com', True),
+    ('JetPack 4 (L4T R32.7.6): Nano firmware, nvpmodel, video converter, TensorRT 8.2', 'repo.download.nvidia.com', True),
+    ('JetPack 6 (L4T R36.4): CUDA 12.6, cuBLAS 12, cuDNN 9.3', 'repo.download.nvidia.com', True),
+    ('cuda-compat-12-2, NVIDIA\'s CUDA 12.2 upgrade driver for JetPack 5', 'developer.download.nvidia.com', True),
+    ('the 5.10 kernel with this project\'s patches (GPL; source: OE4T and patches/jp5)', 'github.com', None),
+]
+# The 5.10 kernel as one download: build-jp5-kernel.sh's out/ packed by
+# scripts/host/pack-jp5-kernel.sh, published as a release of this repository.
+# Its SHA-256 is pinned here once it is published; until then (None) the
+# kernel comes from a folder given with --kernel.
+KERNEL_BUNDLE_URL = ('https://github.com/igsova/jetson-nano-ubuntu-26/releases/download/'
+                     'kernel-5.10.216-tegra-b35/nano26-kernel-5.10.216-tegra-b35.tar.xz')
+KERNEL_BUNDLE_SHA256 = None
+LICENCES = [
+    ('NVIDIA JetPack licences (driver, CUDA, cuDNN, TensorRT)', 'https://docs.nvidia.com/jetson/jetpack/eula/index.html'),
+]
+
+KERNEL_RELEASE = '5.10.216-tegra'
+DTB = 'tegra210-p3448-0000-p3449-0000-b00-r35.dtb'
+XUSB = 'lib/firmware/tegra21x_xusb_firmware'            # JetPack 4's USB 3 controller firmware
+UPSTREAM_XUSB = 'lib/firmware/nvidia/tegra210/xusb.bin'  # the name 5.10's xhci-tegra asks for
+# Ubuntu Base 26.04.1; the SHA-256 is the one in Ubuntu's signed SHA256SUMS
+# (docs/SAFETY.md has how to check that yourself).
+BASE_URL = 'https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/ubuntu-base-26.04.1-base-arm64.tar.gz'
+BASE_SHA256 = '5a1906794ced63a71a8119c3f211ef5f0bbe0a243001b4bbd41fdf80c5b219fd'
+APT_SOURCES = '''Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports
+Suites: resolute resolute-updates resolute-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+'''
+# As build-u26-root.sh (the reference card's), without recommends.
+BOOT_PACKAGES = [
+    'systemd', 'systemd-sysv', 'systemd-resolved', 'systemd-timesyncd', 'udev', 'dbus',
+    'libpam-systemd', 'libnss-systemd', 'openssh-server', 'network-manager', 'wpasupplicant', 'iw',
+    'wireless-regdb', 'iproute2', 'iputils-ping', 'ca-certificates', 'sudo', 'nano', 'less', 'kmod',
+    'procps', 'locales', 'tzdata', 'python3', 'zstd', 'e2fsprogs', 'usbutils', 'file',
+    'fdisk',  # sfdisk: the first boot grows APP to the card's end
+]
+# 5.10 cannot read 26.04's .zst firmware, so the first boot uncompresses
+# these: the Nano's common USB adapters (Realtek) and M.2 cards (Intel 8265).
+FIRMWARE_PACKAGES = ['linux-firmware-realtek', 'linux-firmware-intel-wireless']
+FIRMWARE_PATTERNS = ['rtlwifi/*', 'rtw88/*', 'rtl_bt/*', 'iwlwifi-8265-*', 'iwlwifi-8000C-*']
+STANDARD_GROUPS = {'adm', 'cdrom', 'sudo', 'dip', 'plugdev', 'video', 'audio', 'render', 'input', 'netdev'}
+STATE = 'var/lib/nano26'
+FIRST_BOOT = '/usr/lib/nano26/first-boot'
+STAGE2 = '/usr/lib/nano26/stage2'
+STAGE2_UNIT = 'nano26-stage2.service'
+
+# --- stage 2's inputs (docs/CONVERTER.md) ---
+# The repository this converter is in; stage 2 runs its scripts.
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# Copied to /usr/lib/nano26/repo for stage 2, at the same paths.
+REPO_FILES = [
+    'scripts/host/build-nano-l4t-debs.py', 'scripts/host/fetch-r35-cuda.py',
+    'scripts/host/fetch-cuda12-probe.py', 'scripts/host/build-nano-cuda12-debs.py',
+    'scripts/jetson/check-u26-r35.sh', 'scripts/jetson/install-nano-cuda12.sh', 'scripts/jetson/check-nano-cuda12.sh',
+    'scripts/jetson/yolo/package-trt82.sh', 'scripts/jetson/yolo/install-trt82.sh',
+    'scripts/jetson/enable-u26-fan.sh', 'scripts/jetson/enable-hdmi-wake.sh', 'scripts/jetson/probe-l4t-video.sh',
+    'tests/video/vic_record.c', 'tests/video/v4l2_plugin_dir.c', 'tests/video/frame_check.py',
+    'tests/video/colour_fit.py', 'tests/video/vic_cuda.py',
+    'tests/cuda/cuda11_probe.py', 'tests/cuda/cuda_libs_probe.py', 'tests/cuda/vector_add.cu',
+    'tests/cuda/gpu_probe.cu', 'tests/cuda/cuda12_dev_check.cu',
+    'tests/gl/egl_probe.py', 'tests/vk/vk_probe.py', 'tests/trt/trt_check.py', 'tests/trt/tiny_cnn.onnx',
+    'tests/trt/expected.json',
+]
+# The reference card's Ubuntu package lists, read from its scripts: the desktop, Unity,
+# glxinfo and GCC 11 (CUDA's host compiler; also the video packages' shims' compiler).
+REFERENCE_LISTS = [('scripts/reference-card/add-u26-desktop.sh', 'PACKAGES'),
+                   ('scripts/reference-card/add-u26-unity.sh', 'PACKAGES'),
+                   ('scripts/reference-card/add-u26-gpu-desktop.sh', 'PACKAGES'),
+                   ('scripts/jetson/add-u26-gcc11.sh', 'PACKAGES')]
+# What stage 2 itself runs: gpg (the CUDA 12 build's key checks), xset and
+# xrandr (the HDMI wake helper), GStreamer's tools (the video check) and the
+# Vulkan loader (the Vulkan check).
+STAGE2_TOOLS = ['gpg', 'x11-xserver-utils', 'gstreamer1.0-tools', 'gstreamer1.0-plugins-base', 'libvulkan1']
+# NVIDIA's Jetson indexes stage 2's sources come from, (suite, release).
+JETSON_INDEXES = [('t210', 'r32.7'), ('common', 'r32.7'), ('t194', 'r35.6'), ('common', 'r35.6'),
+                  ('common', 'r36.4')]
+# JetPack 4's copy of NVIDIA's Jetson key; its fingerprint is fetch-r35-cuda.py's KEY_FINGERPRINT.
+JETSON_KEY = '/etc/apt/trusted.gpg.d/jetson-ota-public.asc'
+# The repositories, as fetch-r35-cuda.py (BASE) and fetch-cuda12-probe.py (CUDA_REPO) name them.
+JETSON_URL = 'https://repo.download.nvidia.com/jetson/'
+CUDA_URL = 'https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/arm64/'
+# Ubuntu 20.04's X server 1.20 (build-nano-l4t-debs.py's UBUNTU_DEBS), from Ubuntu's pool.
+PORTS = 'https://ports.ubuntu.com/ubuntu-ports/'
+FOCAL_POOL = {'xserver-xorg-core': 'pool/main/x/xorg-server/',
+              'xserver-xorg-input-libinput': 'pool/main/x/xserver-xorg-input-libinput/'}
+MIRROR = STATE + '/mirror'
+# As the reference card's u26 entry (set-u26-default.sh), without its kernel-log options.
+APPEND = ('${cbootargs} root=PARTUUID=%s rw rootwait rootfstype=ext4 console=ttyS0,115200n8 '
+          'console=tty0 fbcon=map:0 net.ifnames=0 earlycon=uart8250,mmio32,0x70006000 '
+          'panic=10 log_buf_len=4M')
+EXTLINUX = '''TIMEOUT 30
+DEFAULT %(label)s
+
+MENU TITLE nano26: Ubuntu 26.04 on the 5.10 kernel
+
+LABEL %(label)s
+      MENU LABEL %(menu)s
+      LINUX /boot/jp5/Image
+      FDT /boot/jp5/%(dtb)s
+      INITRD /boot/jp5/initrd-firmware.cpio
+      APPEND %(append)s
+'''
+
+ROOT = '/'
+
+
+def path(p):
+    return os.path.join(ROOT, p.lstrip('/'))
+
+
+def read_text(p, default=None):
+    try:
+        with open(path(p), 'rb') as f:
+            return f.read().decode('utf-8', 'replace')
+    except OSError:
+        return default
+
+
+def human(n):
+    for unit in ('bytes', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if n < 1024 or unit == 'TiB':
+            return ('%d %s' % (n, unit)) if unit == 'bytes' else ('%.1f %s' % (n, unit))
+        n /= 1024.0
+
+
+def parse_size(text):
+    m = re.match(r'^(\d+)([KMGT]?)$', text.strip().upper())
+    if not m:
+        raise argparse.ArgumentTypeError('a size such as 64G or 64000000000')
+    return int(m.group(1)) * 1000 ** ' KMGT'.index(m.group(2) or ' ')
+
+
+class Log:
+    """Lines for the screen and the record; record() lines go to the record only."""
+    def __init__(self):
+        self.lines = []
+        self.file = None
+
+    def say(self, line=''):
+        print(line, flush=True)
+        self.record(line)
+
+    def record(self, text):
+        self.lines.append(text)
+        if self.file:
+            self.file.write(text + '\n')
+            self.file.flush()
+
+    def open(self, folder):
+        self.file = open(os.path.join(folder, 'log.txt'), 'w')
+        self.file.write(''.join(line + '\n' for line in self.lines))
+        self.file.flush()
+
+
+log = Log()
+say = log.say
+
+
+class Check:
+    def __init__(self):
+        self.failed = []
+
+    def result(self, name, ok, detail):
+        say('CHECK %-8s %s  %s' % (name, 'PASS' if ok else 'FAIL', detail))
+        if not ok:
+            self.failed.append(name)
+        return ok
+
+
+# --- GPT (UEFI spec 2.x, chapter 5): header at LBA 1, entries after it ---
+
+HEADER = struct.Struct('<8sIIIIQQQQ16sQIII')
+ENTRY = struct.Struct('<16s16sQQQ72s')
+
+
+def read_gpt(f):
+    f.seek(SECTOR)
+    raw = f.read(HEADER.size)
+    (sig, rev, hsize, hcrc, _, current, backup, first, last, disk_guid,
+     entries_lba, count, esize, ecrc) = HEADER.unpack(raw)
+    if sig != b'EFI PART':
+        raise ValueError('no GPT header at sector 1')
+    f.seek(SECTOR)
+    head = bytearray(f.read(hsize))
+    head[16:20] = b'\0\0\0\0'
+    if zlib.crc32(bytes(head)) & 0xffffffff != hcrc:
+        raise ValueError('GPT header checksum mismatch')
+    f.seek(entries_lba * SECTOR)
+    table = f.read(count * esize)
+    if zlib.crc32(table) & 0xffffffff != ecrc:
+        raise ValueError('GPT entries checksum mismatch')
+    parts = {}
+    for i in range(count):
+        tguid, pguid, start, end, attrs, name = ENTRY.unpack(table[i * esize:i * esize + ENTRY.size])
+        if tguid == b'\0' * 16:
+            continue
+        parts[i + 1] = {
+            'type': str(uuid.UUID(bytes_le=tguid)), 'uuid': str(uuid.UUID(bytes_le=pguid)),
+            'start': start, 'size': end - start + 1, 'attrs': attrs,
+            'name': name.decode('utf-16-le').split('\0', 1)[0],
+        }
+    return {'disk_guid': str(uuid.UUID(bytes_le=disk_guid)), 'first': first, 'last': last,
+            'backup': backup, 'entries': count}, parts
+
+
+# --- checks ---
+
+def check_board(c):
+    raw = read_text('/proc/device-tree/compatible', '')
+    names = [n for n in raw.split('\0') if n]
+    model = read_text('/proc/device-tree/model', '').strip('\0\n')
+    ok = COMPATIBLE in names
+    return c.result('board', ok, '%s (%s)' % (names[0] if names else 'no device tree', model or 'no model')
+                    + ('' if ok else '; this converter is tested only on ' + COMPATIBLE))
+
+
+def dpkg_version(package):
+    status = read_text('/var/lib/dpkg/status', '')
+    for para in status.split('\n\n'):
+        fields = dict(re.findall(r'(?m)^([A-Za-z-]+): (.*)$', para))
+        if fields.get('Package') == package and fields.get('Status', '').endswith(' installed'):
+            return fields.get('Version')
+    return None
+
+
+def check_l4t(c):
+    line = (read_text('/etc/nv_tegra_release', '') or '').splitlines()[:1]
+    m = re.match(r'# R(\d+) \(release\), REVISION: ([\d.]+)', line[0]) if line else None
+    release = (m.group(1), m.group(2)) if m else None
+    boot = dpkg_version(BOOTLOADER_PACKAGE)
+    ok = release == L4T_RELEASE and bool(boot) and boot.startswith('.'.join(L4T_RELEASE) + '-')
+    detail = 'L4T %s, %s %s' % ('R%s.%s' % release if release else 'unknown', BOOTLOADER_PACKAGE, boot or 'not installed')
+    if not ok:
+        detail += '; update to JetPack 4.6.6 (L4T R32.7.6) with NVIDIA\'s apt update first'
+    return c.result('l4t', ok, detail)
+
+
+def check_boot(c):
+    root_dev = None
+    for line in (read_text('/proc/self/mountinfo', '') or '').splitlines():
+        fields = line.split()
+        if len(fields) > 4 and fields[4] == '/':
+            root_dev = fields[2]
+    app_dev = (read_text('/sys/class/block/%sp1/dev' % SOURCE_DISK, '') or '').strip()
+    ok = bool(root_dev) and root_dev == app_dev
+    return c.result('boot', ok, 'root on %s, %sp1 is %s' % (root_dev or 'unknown', SOURCE_DISK, app_dev or 'missing'))
+
+
+def check_source(c, source_disk):
+    try:
+        with open(source_disk, 'rb') as f:
+            info, parts = read_gpt(f)
+    except (OSError, ValueError) as e:
+        c.result('source', False, '%s: %s' % (source_disk, e))
+        return None
+    app = parts.get(1)
+    boot = {n: p for n, p in parts.items() if n != 1}
+    problems = []
+    if sorted(parts) != list(range(1, 15)):
+        problems.append('partitions %s, expected 1 to 14' % sorted(parts))
+    if not app or app['name'] != 'APP':
+        problems.append('partition 1 is not APP')
+    elif any(p['start'] + p['size'] > app['start'] for p in boot.values()):
+        problems.append('a boot partition lies after APP')
+    order = sorted(boot, key=lambda n: boot[n]['start'])
+    if order != sorted(boot):
+        problems.append('boot partitions out of order: %s' % order)
+    detail = '%d partitions, APP at sector %d' % (len(parts), app['start']) if app else '%d partitions' % len(parts)
+    c.result('source', not problems, detail + ('; ' + '; '.join(problems) if problems else ''))
+    return None if problems else (info, parts)
+
+
+def mounted_devices():
+    used = set()
+    for name in ('/proc/mounts', '/proc/swaps'):
+        for line in (read_text(name, '') or '').splitlines():
+            dev = line.split()[0] if line.split() else ''
+            if dev.startswith('/dev/'):
+                used.add(os.path.basename(dev))
+    return used
+
+
+def disks():
+    """Whole disks that could be the new card: USB or removable, not the boot card."""
+    used = mounted_devices()
+    out = []
+    try:
+        names = sorted(os.listdir(path('/sys/block')))
+    except OSError:
+        names = []
+    for name in names:
+        if re.match(r'^(loop|ram|zram|nbd|md|dm-|mtdblock|mmcblk)', name):
+            continue
+        base = '/sys/block/' + name
+        real = os.path.realpath(path(base))
+        usb = '/usb' in real
+        removable = (read_text(base + '/removable', '0') or '0').strip() == '1'
+        if not (usb or removable):
+            continue
+        sectors = int((read_text(base + '/size', '0') or '0').strip() or 0)
+        logical = int((read_text(base + '/queue/logical_block_size', '512') or '512').strip() or 512)
+        parts = [p for p in os.listdir(path(base)) if p.startswith(name)] if os.path.isdir(path(base)) else []
+        holders = []
+        for node in [base] + [base + '/' + p for p in parts]:
+            try:
+                holders += os.listdir(path(node + '/holders'))
+            except OSError:
+                pass
+        busy = sorted(({name} | set(parts)) & used) + sorted(holders)
+        model = ' '.join(filter(None, [(read_text(base + '/device/vendor', '') or '').strip(),
+                                       (read_text(base + '/device/model', '') or '').strip()]))
+        out.append({'name': name, 'bytes': sectors * 512, 'logical': logical, 'usb': usb,
+                    'model': model or 'unknown model', 'partitions': len(parts), 'busy': busy})
+    return out
+
+
+def describe(d):
+    return '/dev/%s  %s (%d bytes)  %s%s, %d partition%s%s' % (
+        d['name'], human(d['bytes']), d['bytes'], d['model'], ' on USB' if d['usb'] else '',
+        d['partitions'], '' if d['partitions'] == 1 else 's',
+        ', IN USE: ' + ' '.join(d['busy']) if d['busy'] else '')
+
+
+def check_target_device(c, target):
+    name = os.path.basename(target)
+    if name.startswith(SOURCE_DISK):
+        return c.result('target', False, '%s is the card this system runs from' % target), None
+    if not re.match(r'^/dev/[a-z]+$', target):
+        return c.result('target', False, '%s: give a whole disk such as /dev/sda' % target), None
+    found = [d for d in disks() if d['name'] == name]
+    if not found:
+        return c.result('target', False, '%s is not a USB or removable disk here (see --list)' % target), None
+    d = found[0]
+    problems = []
+    if d['busy']:
+        problems.append('in use: %s (unmount it first)' % ' '.join(d['busy']))
+    if d['logical'] != SECTOR:
+        problems.append('%d-byte sectors, need %d' % (d['logical'], SECTOR))
+    if d['bytes'] < MIN_TARGET:
+        problems.append('smaller than %s' % human(MIN_TARGET))
+    c.result('target', not problems, describe(d) + ('; ' + '; '.join(problems) if problems else ''))
+    return not problems, d
+
+
+def free_bytes(folder):
+    st = os.statvfs(folder)
+    return st.f_bavail * st.f_frsize
+
+
+def check_target_image(c, image, size):
+    """A new image file. It is built in a sparse file of the working size (--size,
+    else what the folder has free, up to IMAGE_WORK_MAX), which never takes more
+    than that, and cut to its contents at the end."""
+    problems = []
+    folder = os.path.dirname(os.path.abspath(image))
+    free = 0
+    if os.path.lexists(image):
+        problems.append('it already exists')
+    if not os.path.isdir(folder):
+        problems.append('its folder does not exist')
+    else:
+        free = max(free_bytes(folder) - IMAGE_RESERVE, 0)
+        if size is None:
+            size = min(free, IMAGE_WORK_MAX) >> 20 << 20
+        if size < IMAGE_WORK_MIN:
+            problems.append('it needs %s to be built in (estimate); %s free there, keeping %s for this system'
+                            % (human(IMAGE_WORK_MIN), human(free), human(IMAGE_RESERVE)))
+        elif size > free:
+            problems.append('%s free there, keeping %s for this system, not %s'
+                            % (human(free), human(IMAGE_RESERVE), human(size)))
+    size = size or 0
+    d = {'name': os.path.basename(image), 'bytes': size, 'logical': SECTOR, 'image': os.path.abspath(image)}
+    c.result('target', not problems, 'image file %s, built in %s, then cut to its contents'
+             % (image, human(size)) + ('; ' + '; '.join(problems) if problems else ''))
+    return not problems, d
+
+
+def sha256_file(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def downloads_kernel(args):
+    """Whether the kernel is the published download, not a folder given with --kernel."""
+    return not args.kernel and KERNEL_BUNDLE_SHA256 is not None
+
+
+def fetch_kernel(folder):
+    """The published kernel, checked against its pinned SHA-256 and unpacked in
+    FOLDER, then checked as a folder given with --kernel is. Returns its folder."""
+    name = KERNEL_BUNDLE_URL.rsplit('/', 1)[1]
+    say('The 5.10 kernel: downloading %s' % name)
+    bundle = os.path.join(folder, name)
+    download(source_url(KERNEL_BUNDLE_URL), bundle, KERNEL_BUNDLE_SHA256)
+    run('tar', '--extract', '--xz', '--file', bundle, '--directory', folder, '--no-same-owner')
+    os.unlink(bundle)
+    kernel = os.path.join(folder, 'nano26-kernel')
+    c = Check()
+    if not check_kernel(c, kernel):
+        raise Failed('the downloaded kernel does not pass its check')
+    return kernel
+
+
+def check_kernel(c, folder):
+    """build-jp5-kernel.sh's out/: every file in SHA256SUMS, the Image, DTB and modules."""
+    sums = {}
+    try:
+        with open(os.path.join(folder, 'SHA256SUMS')) as f:
+            for line in f:
+                digest, name = line.rstrip('\n').split('  ', 1)
+                sums[name] = digest
+    except (OSError, ValueError) as e:
+        return c.result('kernel', False, '%s: no readable SHA256SUMS (%s)' % (folder, e))
+    present = set()
+    for top, dirs, files in os.walk(folder):
+        for name in files:
+            rel = os.path.relpath(os.path.join(top, name), folder)
+            if rel != 'SHA256SUMS':
+                present.add(rel)
+    problems = []
+    if present != set(sums):
+        problems.append('files and SHA256SUMS differ: %s' % ', '.join(sorted(present ^ set(sums))[:3]))
+    for name, digest in sorted(sums.items()):
+        if name in present and sha256_file(os.path.join(folder, name)) != digest:
+            problems.append('%s does not match SHA256SUMS' % name)
+    try:
+        with open(os.path.join(folder, 'Image'), 'rb') as f:
+            data = f.read()
+        if data[56:60] != b'ARM\x64' or ('Linux version %s ' % KERNEL_RELEASE).encode() not in data:
+            problems.append('Image is not a %s arm64 kernel' % KERNEL_RELEASE)
+    except OSError:
+        problems.append('no Image')
+    try:
+        with open(os.path.join(folder, 'dtb', DTB), 'rb') as f:
+            data = f.read()
+        if data[:4] != b'\xd0\x0d\xfe\xed' or COMPATIBLE.encode() not in data:
+            problems.append('dtb/%s is not the Nano B01 device tree' % DTB)
+    except OSError:
+        problems.append('no dtb/%s' % DTB)
+    dep = os.path.join(folder, 'modules/lib/modules', KERNEL_RELEASE, 'modules.dep')
+    try:
+        with open(dep) as f:
+            if '/nvgpu.ko:' not in f.read():
+                problems.append('modules.dep has no nvgpu')
+    except OSError:
+        problems.append('no modules for %s' % KERNEL_RELEASE)
+    return c.result('kernel', not problems, '%s, %s, %d files' % (folder, KERNEL_RELEASE, len(sums))
+                    + ('; ' + '; '.join(problems) if problems else ''))
+
+
+def first_boot_script():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'nano26-first-boot')
+
+
+def stage2_files():
+    """nano26-stage2 and its unit, beside this script."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, 'nano26-stage2'), os.path.join(here, STAGE2_UNIT)
+
+
+_modules = {}
+
+
+def repo_module(rel):
+    """One of this repository's Python scripts, loaded as a module (once)."""
+    if rel not in _modules:
+        spec = importlib.util.spec_from_file_location(re.sub(r'\W', '_', os.path.basename(rel)),
+                                                      os.path.join(REPO, rel))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _modules[rel] = module
+    return _modules[rel]
+
+
+def cuda12():
+    """build-nano-cuda12-debs.py: its package choice, and through .fetch and
+    .probe the index checks of fetch-r35-cuda.py and fetch-cuda12-probe.py."""
+    return repo_module('scripts/host/build-nano-cuda12-debs.py')
+
+
+def l4t():
+    """build-nano-l4t-debs.py: the NVIDIA and Ubuntu 20.04 packages it pins."""
+    return repo_module('scripts/host/build-nano-l4t-debs.py')
+
+
+def bash_array(rel, name):
+    """The words of NAME=( ... ) in the repository's bash script REL."""
+    with open(os.path.join(REPO, rel)) as f:
+        found = re.search(r'^%s=\(([^)]*)\)' % name, f.read(), re.M)
+    if not found:
+        raise ValueError('no %s=(...) in %s' % (name, rel))
+    return re.sub(r'#[^\n]*', '', found.group(1)).split()
+
+
+INSTALL_PINS = None  # --nvidia-test-plan's stand-ins for install_pins()
+
+
+def install_pins():
+    """install-u26-r35.sh's pinned NVIDIA packages, {file name: SHA-256}; its
+    nano-l4t entries are the owner's builds, which stage 2 makes anew."""
+    if INSTALL_PINS is not None:
+        return dict(INSTALL_PINS)
+    with open(os.path.join(REPO, 'scripts/jetson/install-u26-r35.sh')) as f:
+        pins = re.findall(r'^\s*\[([A-Za-z0-9.+~_-]+\.deb)\]=([0-9a-f]{64})\s*$', f.read(), re.M)
+    return {name: digest for name, digest in pins if not name.startswith('nano-l4t-')}
+
+
+_stage2_packages = []
+
+
+def stage2_packages():
+    """Ubuntu's packages for stage 2: the reference card's lists, STAGE2_TOOLS and what the
+    nano-l4t packages depend on (the first of each set of alternatives)."""
+    if _stage2_packages:
+        return list(_stage2_packages)
+    names = []
+    for rel, var in REFERENCE_LISTS:
+        names += bash_array(rel, var)
+    names += STAGE2_TOOLS
+    m = l4t()
+    for line in [s['depends'] for s in m.R35_PACKAGES.values()] + [v['depends'] for v in m.VIDEOS.values()]:
+        for group in line.split(','):
+            first = re.split(r'[\s(]', group.split('|')[0].strip(), maxsplit=1)[0]
+            if first and not first.startswith('nano-l4t-'):
+                names.append(first)
+    for name in names:
+        if name not in _stage2_packages and name not in BOOT_PACKAGES:
+            _stage2_packages.append(name)
+    return list(_stage2_packages)
+
+
+def owner_account(users):
+    """The account stage 2 builds and checks as: the one that ran sudo, else the first."""
+    names = [a['name'] for a in users]
+    sudo = os.environ.get('SUDO_USER')
+    return sudo if sudo in names else (names[0] if names else None)
+
+
+def key_fingerprints(key):
+    """The fingerprints in an OpenPGP key file, primary first (gpg in a throwaway home)."""
+    home = tempfile.mkdtemp(prefix='nano26-gpg-')
+    try:
+        shown = subprocess.run(['gpg', '--homedir', home, '--batch', '--with-colons', '--import-options',
+                                'show-only', '--import', key], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+    return [line.split(':')[9] for line in shown.stdout.splitlines() if line.startswith('fpr:')]
+
+
+def check_stage2_inputs(c):
+    """The repository's files for stage 2, the reference card's package lists, and NVIDIA's key."""
+    problems = []
+    for name in stage2_files():
+        if not os.path.isfile(name):
+            problems.append('%s is not beside this script' % os.path.basename(name))
+    missing = [rel for rel in REPO_FILES if not os.path.isfile(os.path.join(REPO, rel))]
+    if missing:
+        problems.append('not in this copy of the repository: %s' % ', '.join(missing[:3]))
+    try:
+        pins = install_pins()
+        packages = stage2_packages()
+        cuda12()
+        if len(pins) != 19:
+            problems.append('install-u26-r35.sh pins %d NVIDIA packages, not 19' % len(pins))
+    except (OSError, ValueError, ImportError, SyntaxError, AttributeError, KeyError) as e:
+        problems.append('cannot read the repository\'s scripts (%s)' % e)
+        packages = []
+    c.result('stage2', not problems, '%d repository files, %d Ubuntu packages for the GPU stack and desktops'
+             % (len(REPO_FILES), len(packages)) + ('; ' + '; '.join(problems) if problems else ''))
+    tools = [t for t in ('gpg', 'gpgv') if not shutil.which(t)]
+    key = path(JETSON_KEY)
+    if tools:
+        return c.result('nvidia-key', False, 'no %s (gnupg)' % ' or '.join(tools))
+    if not os.path.isfile(key):
+        return c.result('nvidia-key', False, 'no %s (NVIDIA\'s apt key, which JetPack 4 installs)' % JETSON_KEY)
+    try:
+        want = cuda12().fetch.KEY_FINGERPRINT
+    except Exception:  # reported by the stage2 check above
+        return c.result('nvidia-key', False, 'the repository\'s fetch-r35-cuda.py did not load')
+    got = key_fingerprints(key)
+    return c.result('nvidia-key', bool(got) and got[0] == want, '%s, primary key %s' % (
+        JETSON_KEY, got[0] if got else 'unreadable') + ('' if got and got[0] == want else '; expected %s' % want))
+
+
+def check_helpers(c):
+    problems = []
+    if not os.path.isfile(first_boot_script()):
+        problems.append('nano26-first-boot is not beside this script')
+    if not os.path.isfile(path('/' + XUSB)):
+        problems.append('no /%s (nvidia-l4t-firmware)' % XUSB)
+    return c.result('helpers', not problems, 'nano26-first-boot and /%s' % XUSB
+                    + ('; ' + '; '.join(problems) if problems else ''))
+
+
+def check_clock(c):
+    year = time.gmtime().tm_year
+    return c.result('clock', year >= 2026, 'UTC %s' % time.strftime('%Y-%m-%d %H:%M', time.gmtime())
+                    + ('' if year >= 2026 else '; set the clock (network time) first: apt checks signature dates'))
+
+
+def check_network(c):
+    ctx = ssl.create_default_context()
+    bad = []
+    for label, url in HOSTS:
+        try:
+            req = urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'nano26-convert'})
+            urllib.request.urlopen(req, timeout=20, context=ctx).close()
+        except urllib.error.HTTPError:
+            pass                      # the host answered; an error page still proves the route
+        except (OSError, socket.timeout) as e:
+            bad.append('%s (%s)' % (label, getattr(e, 'reason', e)))
+    return c.result('network', not bad, 'all %d hosts answer' % len(HOSTS) if not bad else 'no answer from ' + ', '.join(bad))
+
+
+# --- what is copied from this system ---
+
+def accounts():
+    """People's accounts: uid 1000 to 59999 with a login shell."""
+    out = []
+    for line in (read_text('/etc/passwd', '') or '').splitlines():
+        f = line.split(':')
+        if len(f) == 7 and f[2].isdigit() and f[3].isdigit() and 1000 <= int(f[2]) < 60000 \
+                and not f[6].endswith(('nologin', 'false')):
+            out.append({'name': f[0], 'uid': int(f[2]), 'gid': int(f[3]), 'gecos': f[4], 'home': f[5]})
+    return out
+
+
+def host_keys():
+    try:
+        names = sorted(os.listdir(path('/etc/ssh')))
+    except OSError:
+        return []
+    return [k for k in names if re.match(r'^ssh_host_\w+_key$', k) and k + '.pub' in names]
+
+
+def network_profiles():
+    folder = path('/etc/NetworkManager/system-connections')
+    try:
+        return [n for n in sorted(os.listdir(folder)) if os.path.isfile(os.path.join(folder, n))]
+    except OSError:
+        return []
+
+
+def time_zone():
+    zone = (read_text('/etc/timezone', '') or '').strip()
+    if not zone and os.path.islink(path('/etc/localtime')):
+        zone = os.readlink(path('/etc/localtime')).split('zoneinfo/', 1)[-1]
+    return zone if re.match(r'^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$', zone) else ''
+
+
+def locale_settings():
+    """LANG and LC_* from /etc/default/locale whose value is a UTF-8 locale localedef can build."""
+    out = []
+    for line in (read_text('/etc/default/locale', '') or '').splitlines():
+        m = re.match(r'^(LANG|LC_[A-Z]+)="?([^"]*)"?$', line.strip())
+        if not m:
+            continue
+        v = re.match(r'^([a-z]{2,3}_[A-Z]{2})\.(UTF-8|utf8)$', m.group(2))
+        if v:
+            out.append((m.group(1), v.group(1) + '.UTF-8'))
+        elif m.group(2) in ('C.UTF-8', 'C.utf8'):
+            out.append((m.group(1), 'C.UTF-8'))
+    return out
+
+
+def identity():
+    users = []
+    for a in accounts():
+        keys = read_text(a['home'] + '/.ssh/authorized_keys', '') or ''
+        users.append((a['name'], a['uid'], len([k for k in keys.splitlines() if k.strip() and not k.startswith('#')])))
+    return {'users': users, 'hostname': (read_text('/etc/hostname', '') or '').strip(), 'zone': time_zone(),
+            'lang': dict(locale_settings()).get('LANG', ''), 'profiles': len(network_profiles()),
+            'hostkeys': len(host_keys())}
+
+
+# --- the plan ---
+
+def target_layout(parts, total_bytes):
+    total = total_bytes // SECTOR
+    last_usable = total - 34                          # backup entries (32 sectors) and header
+    app = parts[1]
+    end = last_usable - (last_usable + 1 - app['start']) % 2048   # APP's size a whole MiB
+    layout = {n: dict(p) for n, p in parts.items() if n != 1}
+    layout[1] = dict(app, size=end - app['start'] + 1, uuid='(new)')
+    return layout
+
+
+def nvidia_downloads():
+    return [what for what, host, now in DOWNLOADS if now and 'nvidia' in host]
+
+
+def print_plan(source, target, args):
+    info, parts = source
+    layout = target_layout(parts, target['bytes'])
+    say()
+    say('PLAN')
+    if target.get('image'):
+        say('The new card, as an image file: %s' % target['image'])
+        say('It is built in %s of the free space there, then cut to its contents (about' % human(target['bytes']))
+        say('6 GB, estimate). Written to a whole card of 32 GB or more, its first boot grows')
+        say('APP to the card\'s end. The running card is only read, apart from the image file.')
+    else:
+        say('The new card: /dev/%s, %s. The running card is only read.' % (target['name'], human(target['bytes'])))
+        if target['bytes'] < TIGHT_TARGET:
+            say('  Note: below 64 GB the build may run short of space (estimate, not yet measured).')
+    say()
+    say('1. Partition table (GPT), the 13 boot partitions copied unchanged from %s:' % SOURCE_DISK)
+    for n in sorted(layout, key=lambda n: layout[n]['start']):
+        p = layout[n]
+        size = 'to the end' if n == 1 and target.get('image') else human(p['size'] * SECTOR)
+        say('   p%-2d %-8s start %9d  %10s  %s' % (n, p['name'], p['start'], size,
+                                                 'new ext4, Ubuntu 26.04' if n == 1 else 'copied'))
+    say('2. Downloaded to the new card, each checked by signature or SHA-256:')
+    downloads = [(what, host, downloads_kernel(args) if now is None else now) for what, host, now in DOWNLOADS]
+    for what, host, now in downloads:
+        if now:
+            say('   - %s (%s)' % (what, host))
+    later = ['%s (%s)' % (what, host) for what, host, now in downloads if not now]
+    if later:
+        say('   Not downloaded: %s; the kernel comes from %s.' % (
+            '; '.join(later), args.kernel or 'the folder given with --kernel'))
+    say('3. Copied from this system:')
+    ident = identity()
+    for name, uid, keys in ident['users']:
+        say('   - account %s (uid %d) with its password and groups, %d SSH authorized key%s'
+            % (name, uid, keys, '' if keys == 1 else 's'))
+    say('   - hostname %s, time zone %s, locale %s' % (
+        ident['hostname'] if args.copy_hostname else 'jetson-nano (not copied)',
+        ident['zone'] or 'Etc/UTC', ident['lang'] or 'C.UTF-8'))
+    say('   - %d network profile%s (Wi-Fi included; names are not shown)%s'
+        % (ident['profiles'], '' if ident['profiles'] == 1 else 's', '' if args.copy_network else ': not copied'))
+    say('   - %d SSH host key%s%s' % (ident['hostkeys'], '' if ident['hostkeys'] == 1 else 's',
+                                     '' if args.copy_ssh_host_keys else ': not copied (new keys are made)'))
+    owner = owner_account(accounts())
+    say('4. The new card\'s first boot installs Ubuntu\'s packages on the 5.10 kernel, creates')
+    say('   the accounts and restarts into Ubuntu 26.04 with SSH and the network profiles above.')
+    say('5. Its next boot (stage 2, a systemd service, no network needed) builds the NVIDIA')
+    say('   packages as %s, installs them, checks the GPU stack, sets up the desktops and' % owner)
+    say('   restarts into the login screen. On this project\'s Nano the first boot took about')
+    say('   10 minutes and this one about 70 (2026-10-22).')
+    if nvidia_downloads():
+        say()
+        say('NVIDIA\'s packages are downloaded from NVIDIA under NVIDIA\'s terms:')
+        for what, url in LICENCES:
+            say('   - %s: %s' % (what, url))
+
+
+def confirm(target, args):
+    name = target['name']
+    if args.confirm is not None:
+        return args.confirm == name
+    if not sys.stdin.isatty():
+        say('No terminal to confirm on: pass --confirm %s to go ahead.' % name)
+        return False
+    say()
+    if target.get('image'):
+        say('The image %s will be written. Type its name (%s) to go ahead, anything else to stop.'
+            % (target['image'], name))
+    else:
+        say('Everything on /dev/%s will be erased. Type its name (%s) to go ahead, anything else to stop.'
+            % (name, name))
+    try:
+        return input('> ').strip() == name
+    except EOFError:
+        return False
+
+
+def accept_licences(args):
+    if not nvidia_downloads() or args.accept_nvidia_licences:
+        return True
+    if not sys.stdin.isatty():
+        say('No terminal to answer on: pass --accept-nvidia-licences after reading the terms above.')
+        return False
+    try:
+        return input('Do you accept NVIDIA\'s terms for these packages? Type yes: ').strip().lower() == 'yes'
+    except EOFError:
+        return False
+
+
+def open_record():
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    base = '/var/log/nano26-convert' if os.geteuid() == 0 and ROOT == '/' else \
+        os.path.join(os.path.expanduser('~'), '.cache', 'nano26-convert')
+    folder, n = os.path.join(base, stamp), 1
+    while os.path.lexists(folder):
+        n += 1
+        folder = os.path.join(base, '%s-%d' % (stamp, n))
+    try:
+        os.makedirs(folder, mode=0o700)
+        log.open(folder)
+        return folder
+    except OSError as e:
+        print('Record not saved: %s' % e)
+        return None
+
+
+# --- writing the new card ---
+
+class Failed(Exception):
+    pass
+
+
+def run(*cmd, **kw):
+    """Run a command; its output goes to the record, and to the screen if it fails
+    (exits other than ok, which is 0 only unless given)."""
+    quiet = kw.pop('quiet', False)
+    ok = kw.pop('ok', (0,))
+    log.record('$ ' + kw.pop('shown', ' '.join(cmd)))
+    p = subprocess.run(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       universal_newlines=True, **kw)
+    if p.stdout:
+        log.record(p.stdout.rstrip('\n'))
+    if p.returncode not in ok:
+        if not quiet:
+            print(p.stdout[-3000:])
+        raise Failed('%s exited with %d' % (' '.join(cmd[:3]), p.returncode))
+    return p.stdout
+
+
+def in_root(root, *cmd):
+    """A command in the new root, with a clean environment and this system's proxy, if any.
+    The record shows the command without the environment: a proxy address can hold a password."""
+    env = ['HOME=/root', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL=C', 'TERM=dumb',
+           'DEBIAN_FRONTEND=noninteractive']
+    env += ['%s=%s' % (k, os.environ[k]) for k in ('http_proxy', 'https_proxy', 'no_proxy',
+                                                   'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY') if k in os.environ]
+    return run('chroot', root, '/usr/bin/env', '-i', *(env + list(cmd)),
+               shown='chroot %s %s' % (root, ' '.join(cmd)))
+
+
+def attrs_text(bits):
+    names = {0: 'RequiredPartition', 1: 'NoBlockIOProtocol', 2: 'LegacyBIOSBootable'}
+    if bits & ~(0b111 | (0xffff << 48)):
+        raise Failed('partition attributes 0x%x cannot be copied' % bits)
+    out = [names[b] for b in sorted(names) if bits >> b & 1]
+    return ' '.join(out + ['GUID:%d' % b for b in range(48, 64) if bits >> b & 1])
+
+
+def target_bytes(target):
+    with open(target, 'rb') as f:
+        return f.seek(0, os.SEEK_END)
+
+
+def write_table(target, info, layout, disk_guid):
+    """Wipe the old tables, write the new GPT with sfdisk, and read it back."""
+    size = target_bytes(target)
+    with open(target, 'r+b') as f:
+        for offset in (0, size - 34 * SECTOR):
+            f.seek(offset)
+            f.write(b'\0' * 34 * SECTOR)
+        f.flush()
+        os.fsync(f.fileno())
+    lines = ['label: gpt', 'label-id: %s' % disk_guid.upper(), 'unit: sectors',
+             'first-lba: %d' % info['first'], '']
+    for n in range(1, 15):
+        p = layout[n]
+        line = 'start=%d, size=%d, type=%s, uuid=%s, name="%s"' % (
+            p['start'], p['size'], p['type'].upper(), p['uuid'].upper(), p['name'])
+        if p['attrs']:
+            line += ', attrs="%s"' % attrs_text(p['attrs'])
+        lines.append(line)
+    run('sfdisk', '--no-reread', '--no-tell-kernel', target, input='\n'.join(lines) + '\n')
+    with open(target, 'rb') as f:
+        new_info, new_parts = read_gpt(f)
+    for n in range(1, 15):
+        want, got = layout[n], new_parts.get(n)
+        if not got or any(str(want[k]).lower() != str(got[k]).lower()
+                          for k in ('start', 'size', 'type', 'uuid', 'name', 'attrs')):
+            raise Failed('partition %d did not take: %r' % (n, got))
+    if new_info['disk_guid'].lower() != disk_guid.lower():
+        raise Failed('the disk GUID did not take')
+    say('  table written: 14 partitions, APP %s' % human(layout[1]['size'] * SECTOR))
+
+
+def copy_boot_partitions(source, target, parts):
+    """p2 to p14 byte for byte, each read back from the target and compared."""
+    with open(source, 'rb') as s, open(target, 'r+b') as t:
+        for n in range(2, 15):
+            p = parts[n]
+            offset, length = p['start'] * SECTOR, p['size'] * SECTOR
+            s.seek(offset)
+            data = s.read(length)
+            if len(data) != length:
+                raise Failed('short read of %s' % p['name'])
+            t.seek(offset)
+            t.write(data)
+            t.flush()
+            os.fsync(t.fileno())
+            os.posix_fadvise(t.fileno(), offset, length, os.POSIX_FADV_DONTNEED)
+            t.seek(offset)
+            if t.read(length) != data:
+                raise Failed('%s did not read back the same' % p['name'])
+            log.record('copied p%d %s, %d bytes, sha256 %s' % (n, p['name'], length, hashlib.sha256(data).hexdigest()))
+    say('  13 boot partitions copied and read back')
+
+
+def ext4_header(spec):
+    fields = {}
+    for line in run('debugfs', '-R', 'stats -h', spec, quiet=True).splitlines():
+        key, sep, value = line.partition(':')
+        if sep:
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def make_app_filesystem(node, source_app):
+    """ext4 with the running APP's features and label, which U-Boot reads."""
+    head = ext4_header(source_app)
+    features = [f for f in head.get('Filesystem features', '').split() if f != 'needs_recovery']
+    if 'extent' not in features:
+        raise Failed('cannot read the running APP\'s ext4 features')
+    label = head.get('Filesystem volume name', '')
+    fs_uuid = str(uuid.uuid4())
+    cmd = ['mkfs.ext4', '-q', '-F', '-U', fs_uuid, '-O', 'none,' + ','.join(features),
+           '-E', 'nodiscard,root_owner=0:0']
+    if label and label != '<none>':
+        cmd += ['-L', label]
+    run(*(cmd + [node]))
+    got = ext4_header(node).get('Filesystem features', '').split()
+    if sorted(got) != sorted(features):
+        raise Failed('the new APP has features %s, not %s' % (' '.join(got), ' '.join(features)))
+    say('  APP formatted: ext4 with the running APP\'s features (%s)' % ' '.join(sorted(features)))
+    return fs_uuid
+
+
+def cut_image(where, info, parts, layout, disk_guid):
+    """APP's ext4 shrunk to its contents and IMAGE_ROOM, the file cut after it, and
+    the GPT written again for the shorter file, with its backup copy at the new
+    end. The first boot grows APP and its ext4 to the end of the card the image
+    is written to. Returns the image's size."""
+    if run('losetup', '--associated', where).strip():
+        raise Failed('the image is still attached to a loop device (a lazy unmount?)')
+    m = Mounts()
+    try:
+        node = m.loop(where, layout[1]['start'] * SECTOR, layout[1]['size'] * SECTOR)
+        run('e2fsck', '-f', '-y', node, ok=(0, 1))
+        block = int(ext4_header(node).get('Block size', 0))
+        minimum = re.search(r'minimum size of the filesystem: (\d+)', run('resize2fs', '-P', node))
+        if not block or not minimum:
+            raise Failed('cannot read APP\'s block size or its minimum size')
+        mib = -(-(int(minimum.group(1)) * block + IMAGE_ROOM) // 2 ** 20)
+        run('resize2fs', node, '%dM' % mib)
+        run('e2fsck', '-f', '-n', node)
+    finally:
+        m.release()
+    sectors = mib * 2 ** 20 // SECTOR
+    total = (layout[1]['start'] + sectors + 34) * SECTOR      # the backup GPT after APP
+    with open(where, 'r+b') as f:
+        f.truncate(total)
+    cut = target_layout(parts, total)
+    cut[1]['uuid'] = layout[1]['uuid']
+    if cut[1]['size'] != sectors:
+        raise Failed('the cut APP would be %d sectors, not %d' % (cut[1]['size'], sectors))
+    write_table(where, info, cut, disk_guid)
+    return total
+
+
+def hand_over(where):
+    """The image and its SHA-256 file, for the account that ran sudo and only it: the
+    image holds the password hashes, SSH keys and network profiles copied into it."""
+    digest = sha256_file(where)
+    with open(where + '.sha256', 'w') as f:
+        f.write('%s  %s\n' % (digest, os.path.basename(where)))
+    for p in (where, where + '.sha256'):
+        os.chmod(p, 0o600)
+        if os.environ.get('SUDO_UID', '').isdigit() and os.environ.get('SUDO_GID', '').isdigit():
+            os.chown(p, int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID']))
+    log.record('image sha256 %s' % digest)
+    return digest
+
+
+def wait_for(node, seconds=20):
+    for _ in range(seconds * 4):
+        if os.path.exists(node):
+            return node
+        time.sleep(0.25)
+    raise Failed('%s did not appear' % node)
+
+
+def download(url, dest, sha256):
+    """Fetch url to dest over HTTPS and check its SHA-256."""
+    tmp = dest + '.part'
+    h = hashlib.sha256()
+    req = urllib.request.Request(url, headers={'User-Agent': 'nano26-convert'})
+    with urllib.request.urlopen(req, timeout=60, context=ssl.create_default_context()) as r, open(tmp, 'wb') as f:
+        for block in iter(lambda: r.read(1 << 20), b''):
+            h.update(block)
+            f.write(block)
+    if h.hexdigest() != sha256:
+        os.unlink(tmp)
+        raise Failed('%s does not match its pinned SHA-256' % url)
+    os.rename(tmp, dest)
+    log.record('downloaded %s, sha256 %s' % (url, h.hexdigest()))
+
+
+def ubuntu_base(app):
+    tarball = os.path.join(app, 'ubuntu-base.tar.gz')
+    download(BASE_URL, tarball, BASE_SHA256)
+    run('tar', '--extract', '--gzip', '--file', tarball, '--directory', app, '--numeric-owner',
+        '--same-owner', '--same-permissions', '--delay-directory-restore')
+    os.unlink(tarball)
+    os.chmod(app, 0o755)              # _apt must be able to traverse the root
+    with open(os.path.join(app, 'etc/os-release')) as f:
+        if 'VERSION_ID="26.04"' not in f.read():
+            raise Failed('the base is not Ubuntu 26.04')
+    say('  Ubuntu Base 26.04.1 checked (SHA-256) and extracted')
+
+
+class Mounts:
+    """Mounts and loop devices, released in reverse order."""
+    def __init__(self):
+        self.stack = []
+
+    def mount(self, *args):
+        run('mount', *args)
+        self.stack.append(args[-1])
+
+    def loop(self, image, offset, size):
+        dev = run('losetup', '--find', '--show', '--offset', str(offset), '--sizelimit', str(size), image).strip()
+        self.stack.append(('loop', dev))
+        return dev
+
+    def release(self):
+        while self.stack:
+            top = self.stack.pop()
+            if isinstance(top, tuple):
+                subprocess.run(['losetup', '--detach', top[1]])
+            elif subprocess.run(['umount', '--recursive', top]).returncode != 0:
+                subprocess.run(['umount', '--recursive', '--lazy', top])
+                say('  (%s needed a lazy unmount)' % top)
+
+
+def chroot_setup(app, m):
+    m.mount('-t', 'proc', 'proc', os.path.join(app, 'proc'))
+    m.mount('--bind', '/sys', os.path.join(app, 'sys'))
+    run('mount', '-o', 'remount,bind,ro', os.path.join(app, 'sys'))
+    m.mount('--rbind', '/dev', os.path.join(app, 'dev'))
+    run('mount', '--make-rslave', os.path.join(app, 'dev'))
+    m.mount('-t', 'tmpfs', '-o', 'nosuid,nodev,mode=0755,size=64m', 'tmpfs', os.path.join(app, 'run'))
+    # resolved's stub path, filled from this system for the downloads; it is
+    # the link the installed systemd-resolved keeps.
+    stub = os.path.join(app, 'run/systemd/resolve')
+    os.makedirs(stub)
+    with open('/etc/resolv.conf', 'rb') as s, open(os.path.join(stub, 'stub-resolv.conf'), 'wb') as d:
+        d.write(s.read())
+    resolv = os.path.join(app, 'etc/resolv.conf')
+    if os.path.lexists(resolv):
+        os.unlink(resolv)
+    os.symlink('../run/systemd/resolve/stub-resolv.conf', resolv)
+    write_file(os.path.join(app, 'etc/apt/sources.list.d/ubuntu.sources'), APT_SOURCES)
+    if os.path.lexists(os.path.join(app, 'etc/apt/sources.list')):
+        os.unlink(os.path.join(app, 'etc/apt/sources.list'))
+
+
+def download_packages(app):
+    """Ubuntu's packages and Wi-Fi firmware for the first boot, which installs
+    them in the same request (so apt resolves it as here); nothing is installed here."""
+    in_root(app, 'apt-get', 'update')
+    in_root(app, 'apt-get', '--yes', '--download-only', 'full-upgrade')
+    in_root(app, 'apt-get', '--yes', '--download-only', '--no-install-recommends', 'install',
+            *(BOOT_PACKAGES + stage2_packages()))
+    debs = [d for d in os.listdir(os.path.join(app, 'var/cache/apt/archives')) if d.endswith('.deb')]
+    if not any(d.startswith('systemd_259') for d in debs):
+        raise Failed('apt did not fetch systemd 259')
+    firmware = os.path.join(app, STATE, 'firmware')
+    os.makedirs(firmware)
+    in_root(app, 'sh', '-c', 'cd /%s/firmware && apt-get download "$@"' % STATE, 'sh', *FIRMWARE_PACKAGES)
+    got = sorted(d for d in os.listdir(firmware) if d.endswith('.deb'))
+    if len(got) != len(FIRMWARE_PACKAGES):
+        raise Failed('firmware packages: got %s' % ', '.join(got))
+    say('  %d packages and %d firmware packages downloaded (apt checks each against Ubuntu\'s signed index)'
+        % (len(debs), len(got)))
+    say('  of which the boot packages and stage 2\'s: %d and %d asked for' % (len(BOOT_PACKAGES), len(stage2_packages())))
+
+
+# Where downloads come from: the servers, unless --nvidia-test-plan names stand-ins.
+SOURCES = {}
+
+
+def source_url(url):
+    for real, stand_in in SOURCES.items():
+        if url.startswith(real):
+            return stand_in + url[len(real):]
+    return url
+
+
+def mirror_file(mirror, url):
+    """URL's place in the copy of the repositories, laid out as the servers are."""
+    return os.path.join(mirror, url.split('://', 1)[1])
+
+
+def mirror_copy(src, dst):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copyfile(src, dst)
+    os.chmod(dst, 0o644)
+
+
+@contextlib.contextmanager
+def recorded_output():
+    """What the repository's modules print goes to the record; their fail() stops the step."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            yield
+    except SystemExit as e:
+        raise Failed(str(e))
+    finally:
+        for line in buf.getvalue().splitlines():
+            log.record('  ' + line)
+
+
+def nvidia_packages(app):
+    """NVIDIA's packages for stage 2, and Ubuntu 20.04's X server, in a copy of
+    the repositories under MIRROR: the signed indexes, checked by
+    fetch-r35-cuda.py's and fetch-cuda12-probe.py's code, then each package
+    against its index entry and, where the repository pins one, its SHA-256.
+    Lists of what each stage 2 step takes go to MIRROR/sets."""
+    m, l = cuda12(), l4t()
+    fetch, probe = m.fetch, m.probe
+    fetch.BASE, probe.CUDA_REPO = source_url(JETSON_URL), source_url(CUDA_URL)
+    mirror = os.path.join(app, MIRROR)
+    work = os.path.join(app, STATE, 'nvidia-work')
+    os.makedirs(work, mode=0o700)
+    key = os.path.join(mirror, 'keys', 'jetson-ota-public.asc')
+    mirror_copy(path(JETSON_KEY), key)
+    indexes = {}
+    with recorded_output():
+        gnupg, keyring = fetch.prepare_keyring(Path(work), Path(key))
+        for suite, release in JETSON_INDEXES:
+            fetch.RELEASE = release
+            run_dir = Path(work) / ('%s-%s' % (suite, release))
+            run_dir.mkdir()
+            url, entries, _ = fetch.fetch_index(run_dir, gnupg, keyring, suite)
+            folder = str(run_dir / 'index' / suite)
+            for name in os.listdir(folder):
+                if name != 'gpgv-status.txt':
+                    rel = 'dists/%s/%s%s' % (release, '' if name.startswith('Release') else 'main/binary-arm64/', name)
+                    mirror_copy(os.path.join(folder, name), mirror_file(mirror, JETSON_URL + suite + '/' + rel))
+            indexes[(suite, release)] = (url, entries)
+        run_dir = Path(work) / 'cuda'
+        run_dir.mkdir()
+        cuda_gnupg, cuda_keyring = probe.cuda_keyring(run_dir)
+        cuda_entries = probe.flat_index(run_dir, cuda_gnupg, cuda_keyring)
+        mirror_copy(str(run_dir / probe.CUDA_KEY_FILE), mirror_file(mirror, CUDA_URL + probe.CUDA_KEY_FILE))
+        for name in os.listdir(str(run_dir / 'index' / 'cuda')):
+            if name != 'gpgv-status.txt':
+                mirror_copy(str(run_dir / 'index' / 'cuda' / name), mirror_file(mirror, CUDA_URL + name))
+    say('  NVIDIA\'s signed indexes checked: Jetson %s, and the CUDA repository'
+        % ', '.join('%s %s' % i for i in JETSON_INDEXES))
+
+    wanted = []  # (set, URL as the servers name it, size or None, SHA-256)
+
+    def take(set_name, suite, release, name, version=None, digest=None):
+        url, entries = indexes[(suite, release)]
+        if version is None:
+            found = [fetch.newest(entries, name, suite)] if name in entries else []
+        else:
+            found = [e for e in entries.get(name, []) if e['Version'] == version
+                     and (digest is None or e['SHA256'] == digest)]
+        if not found:
+            raise Failed('%s %s is not in NVIDIA\'s %s %s index%s' % (
+                name, version or '', suite, release, ' with the SHA-256 this repository pins' if digest else ''))
+        e = found[0]
+        wanted.append((set_name, JETSON_URL + suite + '/' + e['Filename'], int(e['Size']), e['SHA256']))
+
+    # build-nano-l4t-debs.py's sources, as it pins them.
+    for name, digest in sorted(l.NVIDIA_DEBS.items()) + sorted(l.VIDEO_NVIDIA_DEBS.items()):
+        take('l4t', 't210', 'r32.7', name, l.L4T, digest)
+    for name, digest in sorted(l.R35_NVIDIA_DEBS.items()) + sorted(l.R35_VIDEO_DEBS.items()):
+        take('l4t', 't194', 'r35.6', name, l.R35_L4T, digest)
+    for name, (version, digest) in sorted(l.UBUNTU_DEBS.items()):
+        wanted.append(('l4t', PORTS + FOCAL_POOL[name] + '%s_%s_arm64.deb' % (name, version.split(':', 1)[-1]),
+                       None, digest))
+    # install-u26-r35.sh's: CUDA 11.4's runtime libraries, cuDNN 8.6 and TensorRT 8.5.
+    for filename, digest in sorted(install_pins().items()):
+        name, version, _ = filename[:-len('.deb')].split('_')
+        take('install', 'common', 'r35.6', name, version, digest)
+    # package-trt82.sh's: TensorRT 8.2 and what it depends on in the index, as
+    # fetch-r35-cuda.py --set tensorrt --release r32.7 takes them.
+    entries = indexes[('common', 'r32.7')][1]
+    fetch.RELEASE = 'r32.7'
+    absent = [n for n in fetch.TENSORRT_PACKAGES_R32 if n not in entries]
+    if absent:
+        raise Failed('not in NVIDIA\'s common r32.7 index: %s' % ', '.join(absent))
+    queue, trt82 = list(fetch.TENSORRT_PACKAGES_R32), []
+    while queue:
+        name = queue.pop(0)
+        if name in trt82 or name not in entries:
+            continue
+        trt82.append(name)
+        queue += [d for d in fetch.dependency_names(fetch.newest(entries, name, 'common'))
+                  if not d.endswith('-dev') and 'config-common' not in d]
+    for name in trt82:
+        take('trt82', 'common', 'r32.7', name)
+    # build-nano-cuda12-debs.py's, by its own choice.
+    url, entries = indexes[('common', m.R36_RELEASE)]
+    fetch.RELEASE = m.R36_RELEASE
+    with recorded_output():
+        minor, cudart, plan, _, _ = m.choose(url, entries, cuda_entries)
+    for name, base, entry, _ in plan:
+        server = CUDA_URL if base == probe.CUDA_REPO else JETSON_URL + 'common/'
+        wanted.append(('cuda12', server + entry['Filename'], int(entry['Size']), entry['SHA256']))
+
+    sets, done = {}, {}
+    total = sum(size for _, _, size, _ in wanted if size)
+    say('  downloading %d packages (about %s): the driver sets, CUDA 11.4 with cuDNN 8.6 and TensorRT 8.5, '
+        'TensorRT 8.2, and CUDA 12.%d (cuda-cudart-12-%d %s)' % (len(wanted), human(total), minor, minor,
+                                                                    cudart['Version']))
+    for set_name, url, size, digest in wanted:
+        dest = mirror_file(mirror, url)
+        if dest not in done:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            download(source_url(url), dest, digest)
+            if size is not None and os.path.getsize(dest) != size:
+                raise Failed('%s is not the size its index gives' % url)
+            done[dest] = digest
+        sets.setdefault(set_name, []).append('%s  %s\n' % (digest, os.path.relpath(dest, mirror)))
+    for set_name, lines in sets.items():
+        write_file(os.path.join(mirror, 'sets', set_name + '.txt'), ''.join(lines))
+    shutil.rmtree(work)
+    say('  %s: %s' % (MIRROR, ', '.join('%s %d' % (s, len(v)) for s, v in sorted(sets.items()))))
+
+
+def apply_test_plan(name):
+    """Stand-ins for NVIDIA's servers (and Ubuntu 20.04's pool), keys and pins,
+    from a JSON file, for tests on another computer: {"sources": {URL prefix:
+    stand-in prefix}, "fingerprints": {"jetson": ..., "cuda": ...}, "l4t":
+    {build-nano-l4t-debs.py name: value}, "install_pins": {file: SHA-256},
+    "kernel_bundle_sha256": the kernel download's pin}."""
+    global INSTALL_PINS, KERNEL_BUNDLE_SHA256
+    with open(name) as f:
+        plan = json.load(f)
+    SOURCES.update(plan.get('sources', {}))
+    m = cuda12()
+    fingerprints = plan.get('fingerprints', {})
+    m.fetch.KEY_FINGERPRINT = fingerprints.get('jetson', m.fetch.KEY_FINGERPRINT)
+    m.probe.CUDA_KEY_FINGERPRINT = fingerprints.get('cuda', m.probe.CUDA_KEY_FINGERPRINT)
+    for key, value in plan.get('l4t', {}).items():
+        if key == 'UBUNTU_DEBS':
+            value = {n: tuple(v) for n, v in value.items()}
+        setattr(l4t(), key, value)
+    if 'install_pins' in plan:
+        INSTALL_PINS = dict(plan['install_pins'])
+    KERNEL_BUNDLE_SHA256 = plan.get('kernel_bundle_sha256', KERNEL_BUNDLE_SHA256)
+    say('Test plan %s: stand-ins for %s' % (name, ', '.join(sorted(SOURCES)) or 'no server'))
+
+
+def copy_file(src, dst, mode, uid=0, gid=0):
+    with open(src, 'rb') as s:
+        data = s.read()
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, 'wb') as d:
+        os.fchmod(d.fileno(), mode)
+        d.write(data)
+    os.chown(dst, uid, gid)
+
+
+def write_file(dst, text, mode=0o644):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, 'w') as f:
+        os.fchmod(f.fileno(), mode)
+        f.write(text)
+
+
+def cpio_newc(entries):
+    """A newc archive of (name, data or None for a directory), in order."""
+    archive = bytearray()
+    for ino, (name, data) in enumerate(entries + [('TRAILER!!!', b'')], 1):
+        trailer = name == 'TRAILER!!!'
+        mode = 0 if trailer else (0o100644 if data is not None else 0o040755)
+        body = data or b''
+        encoded = name.encode() + b'\0'
+        fields = [0 if trailer else ino, mode, 0, 0, 1 if trailer or data is not None else 2,
+                  0, len(body), 0, 0, 0, 0, len(encoded), 0]
+        archive += b'070701' + ''.join('%08X' % v for v in fields).encode() + encoded
+        archive += b'\0' * (-len(archive) % 4) + body
+        archive += b'\0' * (-len(archive) % 4)
+    return bytes(archive)
+
+
+def install_kernel(app, kernel, partuuid):
+    """The 5.10 kernel, device tree, initrd and modules, and the two boot entries."""
+    boot = os.path.join(app, 'boot/jp5')
+    copy_file(os.path.join(kernel, 'Image'), os.path.join(boot, 'Image'), 0o644)
+    copy_file(os.path.join(kernel, 'dtb', DTB), os.path.join(boot, DTB), 0o644)
+    with open(path('/' + XUSB), 'rb') as f:
+        xusb = f.read()
+    with open(os.path.join(boot, 'initrd-firmware.cpio'), 'wb') as f:
+        f.write(cpio_newc([('lib', None), ('lib/firmware', None), (XUSB, xusb),
+                           ('lib/firmware/nvidia', None), ('lib/firmware/nvidia/tegra210', None),
+                           (UPSTREAM_XUSB, xusb)]))
+    modules = os.path.join(app, 'usr/lib/modules', KERNEL_RELEASE)
+    shutil.copytree(os.path.join(kernel, 'modules/lib/modules', KERNEL_RELEASE), modules, symlinks=True)
+    append = APPEND % partuuid
+    write_file(os.path.join(app, 'boot/extlinux/extlinux.conf'), EXTLINUX % {
+        'label': 'first-boot', 'menu': 'Ubuntu 26.04 first boot (installs, then restarts)',
+        'dtb': DTB, 'append': append + ' init=' + FIRST_BOOT})
+    write_file(os.path.join(app, STATE, 'extlinux.conf'), EXTLINUX % {
+        'label': 'u26', 'menu': 'Ubuntu 26.04 (5.10 kernel)', 'dtb': DTB, 'append': append})
+    say('  kernel %s with its device tree, initrd and modules; extlinux.conf boots the first boot'
+        % KERNEL_RELEASE)
+
+
+def prepare_first_boot(app, fs_uuid):
+    copy_file(first_boot_script(), os.path.join(app, FIRST_BOOT.lstrip('/')), 0o755)
+    state = os.path.join(app, STATE)
+    write_file(os.path.join(state, 'packages'), ''.join(p + '\n' for p in BOOT_PACKAGES + stage2_packages()))
+    write_file(os.path.join(state, 'firmware-patterns'), ''.join(p + '\n' for p in FIRMWARE_PATTERNS))
+    write_file(os.path.join(state, 'written-at'), '%d\n' % time.time())
+    write_file(os.path.join(app, 'usr/sbin/policy-rc.d'), '#!/bin/sh\nexit 101\n', 0o755)
+    write_file(os.path.join(app, 'etc/fstab'), 'UUID=%s / ext4 defaults,noatime,errors=remount-ro 0 1\n' % fs_uuid)
+
+
+ZRAM = '[zram0]\nzram-size = ram / 2\nswap-priority = 100\n'  # as add-u26-desktop.sh
+# OpenSSH 10.1 and newer mark interactive traffic with DSCP EF; some networks
+# drop those packets, and SSH then hangs before its password prompt (on the
+# Nano, 2026-10-22). JetPack 4's OpenSSH 7.6 never sends EF, so neither does
+# the new card.
+SSHD_IPQOS = '# nano26-convert: no DSCP EF marking (docs/CONVERTER.md)\nIPQoS none\n'
+
+
+def prepare_stage2(app):
+    """nano26-stage2, its unit, and the repository files it runs, with their
+    SHA-256 in /usr/lib/nano26/repo/SHA256SUMS, which stage 2 checks. zram swap
+    is set up here, so the first boot with systemd has it for stage 2's builds."""
+    script, unit = stage2_files()
+    copy_file(script, os.path.join(app, STAGE2.lstrip('/')), 0o755)
+    copy_file(unit, os.path.join(app, 'etc/systemd/system', STAGE2_UNIT), 0o644)
+    repo = os.path.join(app, 'usr/lib/nano26/repo')
+    sums = []
+    for rel in REPO_FILES:
+        src = os.path.join(REPO, rel)
+        copy_file(src, os.path.join(repo, rel), 0o755 if os.stat(src).st_mode & 0o111 else 0o644)
+        sums.append('%s  %s\n' % (sha256_file(src), rel))
+    write_file(os.path.join(repo, 'SHA256SUMS'), ''.join(sums))
+    write_file(os.path.join(app, 'etc/systemd/zram-generator.conf'), ZRAM)
+    say('  stage 2 with %d repository files, for the first boot with systemd' % len(REPO_FILES))
+
+
+def copy_identity(app, args):
+    """Host keys, hostname and network profiles in place; accounts, zone and locale staged."""
+    keys = host_keys() if args.copy_ssh_host_keys else []
+    for name in keys:          # openssh-server's install keeps keys that are already there
+        copy_file(path('/etc/ssh/' + name), os.path.join(app, 'etc/ssh', name), 0o600)
+        copy_file(path('/etc/ssh/' + name + '.pub'), os.path.join(app, 'etc/ssh', name + '.pub'), 0o644)
+    write_file(os.path.join(app, 'etc/ssh/sshd_config.d/50-nano26-ipqos.conf'), SSHD_IPQOS)
+    hostname = (read_text('/etc/hostname', '') or '').strip()
+    if not args.copy_hostname or not re.match(r'^[A-Za-z0-9][A-Za-z0-9-]{0,62}$', hostname):
+        hostname = 'jetson-nano'
+    write_file(os.path.join(app, 'etc/hostname'), hostname + '\n')
+    write_file(os.path.join(app, 'etc/hosts'),
+               '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' % hostname)
+    profiles = network_profiles() if args.copy_network else []
+    for name in profiles:
+        base = name[:-len('.nmconnection')] if name.endswith('.nmconnection') else name
+        copy_file(path('/etc/NetworkManager/system-connections/' + name),
+                  os.path.join(app, 'etc/NetworkManager/system-connections', base + '.nmconnection'), 0o600)
+    # Every device managed, as on JetPack 4 (Ubuntu's default leaves wired ones out).
+    write_file(os.path.join(app, 'etc/NetworkManager/conf.d/10-globally-managed-devices.conf'), '')
+    say('  hostname %s, %d SSH host key%s, %d network profile%s' % (
+        hostname, len(keys), '' if len(keys) == 1 else 's', len(profiles), '' if len(profiles) == 1 else 's'))
+
+    # The accounts, for the first boot, which creates them once Ubuntu's groups exist.
+    staged = os.path.join(app, STATE, 'identity')
+    os.makedirs(os.path.join(staged, 'keys'))
+    os.chmod(staged, 0o700)
+    shadow = {}
+    for line in (read_text('/etc/shadow', '') or '').splitlines():
+        f = line.split(':')
+        if len(f) > 1:
+            shadow[f[0]] = f[1]
+    group_names, members = {}, {}
+    for line in (read_text('/etc/group', '') or '').splitlines():
+        f = line.split(':')
+        if len(f) == 4:
+            group_names[f[2]] = f[0]
+            for user in filter(None, f[3].split(',')):
+                members.setdefault(user, set()).add(f[0])
+    rows, hashes = [], []
+    for a in accounts():
+        if not re.match(r'^[a-z_][a-z0-9_-]*$', a['name']) or not a['home'].startswith('/'):
+            raise Failed('account %r cannot be copied' % a['name'])
+        groups = sorted(members.get(a['name'], set()) | STANDARD_GROUPS)
+        rows.append(':'.join([a['name'], str(a['uid']), str(a['gid']), group_names.get(str(a['gid']), a['name']),
+                              a['gecos'], a['home'], ','.join(groups)]))
+        hashed = shadow.get(a['name'], '').startswith('$')
+        if hashed:
+            hashes.append('%s:%s' % (a['name'], shadow[a['name']]))
+        keys_file = path(a['home'] + '/.ssh/authorized_keys')
+        if os.path.isfile(keys_file):
+            copy_file(keys_file, os.path.join(staged, 'keys', a['name']), 0o600)
+        say('  account %s (uid %d)%s' % (a['name'], a['uid'], '' if hashed else ', no password: SSH keys only'))
+    write_file(os.path.join(staged, 'accounts'), ''.join(r + '\n' for r in rows), 0o600)
+    write_file(os.path.join(staged, 'shadow'), ''.join(h + '\n' for h in hashes), 0o600)
+    settings = ['zone=' + (time_zone() or 'Etc/UTC')] + ['locale=%s=%s' % kv for kv in locale_settings()]
+    settings.append('owner=' + owner_account(accounts()))
+    settings.append('card-min=%d' % MIN_TARGET)
+    write_file(os.path.join(app, STATE, 'settings'), ''.join(s + '\n' for s in settings))
+
+
+def stage1(source, target, args):
+    info, parts = source
+    layout = target_layout(parts, target['bytes'])
+    disk_guid = str(uuid.uuid4())
+    layout[1]['uuid'] = str(uuid.uuid4())
+    source_disk = args.source_disk or '/dev/' + SOURCE_DISK
+    source_app = ('%s?offset=%d' % (source_disk, parts[1]['start'] * SECTOR)) if args.source_disk \
+        else '/dev/%sp1' % SOURCE_DISK
+    m = Mounts()
+    started = time.time()
+    created = False
+    steps = 7 if 'image' in target else 6
+    fetched = None
+    try:
+        if not args.kernel:
+            fetched = tempfile.mkdtemp(prefix='nano26-kernel-', dir='/var/tmp')
+            args.kernel = fetch_kernel(fetched)
+        say('STEP 1/%d the new card\'s partitions' % steps)
+        if 'image' in target:
+            where = target['image']
+            fd = os.open(where, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)   # sparse until written
+            created = True
+            try:
+                os.ftruncate(fd, target['bytes'])
+            finally:
+                os.close(fd)
+        else:
+            where = '/dev/' + target['name']
+            again = [d for d in disks() if d['name'] == target['name']]
+            if not again or again[0]['busy'] or again[0]['bytes'] != target['bytes'] \
+                    or target_bytes(where) != target['bytes']:
+                raise Failed('%s changed since the checks (its size, or it is now in use)' % where)
+        write_table(where, info, layout, disk_guid)
+        copy_boot_partitions(source_disk, where, parts)
+        if 'image' in target:
+            node = m.loop(where, layout[1]['start'] * SECTOR, layout[1]['size'] * SECTOR)
+        else:
+            run('blockdev', '--rereadpt', where)
+            run('udevadm', 'settle', quiet=True)
+            node = wait_for(where + '1')
+            sysfs = '/sys/class/block/%s1/' % target['name']
+            with open(sysfs + 'start') as s, open(sysfs + 'size') as z:
+                if (int(s.read()), int(z.read())) != (layout[1]['start'], layout[1]['size']):
+                    raise Failed('%s is not the new APP' % node)
+        fs_uuid = make_app_filesystem(node, source_app)
+        app = '/run/nano26-convert/app'
+        os.makedirs(app, mode=0o700, exist_ok=True)
+        m.mount('-t', 'ext4', '-o', 'noatime', node, app)
+
+        say('STEP 2/%d Ubuntu 26.04 base' % steps)
+        ubuntu_base(app)
+        chroot_setup(app, m)
+
+        say('STEP 3/%d Ubuntu\'s packages, downloaded for the first boot (this takes a while)' % steps)
+        download_packages(app)
+
+        say('STEP 4/%d NVIDIA\'s packages, downloaded for stage 2 (this takes a while)' % steps)
+        nvidia_packages(app)
+
+        say('STEP 5/%d the 5.10 kernel, the first boot and stage 2' % steps)
+        install_kernel(app, args.kernel, layout[1]['uuid'])
+        prepare_first_boot(app, fs_uuid)
+        prepare_stage2(app)
+
+        say('STEP 6/%d copied from this system' % steps)
+        copy_identity(app, args)
+        m.release()
+
+        if 'image' in target:
+            say('STEP 7/7 the image cut to its contents')
+            size = cut_image(where, info, parts, layout, disk_guid)
+            say('  image cut to %s; its first boot grows it to the card\'s end' % human(size))
+            hand_over(where)
+            say('  SHA-256 written to %s.sha256' % os.path.basename(where))
+        run('sync')
+        say('Written in %d min.' % ((time.time() - started) // 60))
+        return True
+    except (Failed, OSError, subprocess.SubprocessError, urllib.error.URLError, KeyboardInterrupt) as e:
+        say('STOPPED: %s' % (str(e) or type(e).__name__))
+        m.release()
+        if created:
+            for p in (where, where + '.sha256'):
+                with contextlib.suppress(OSError):
+                    os.unlink(p)
+            say('  The unfinished image was deleted.')
+        return False
+    finally:
+        m.release()
+        if fetched:
+            shutil.rmtree(fetched, ignore_errors=True)
+
+
+def main():
+    global ROOT
+    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument('--list', action='store_true', help='list the disks that could be the new card')
+    group.add_argument('--target', help='the new card, a whole disk such as /dev/sda')
+    group.add_argument('--target-image', help='write an image file instead of a card')
+    ap.add_argument('--size', type=parse_size,
+                    help='the space --target-image is built in, such as 12G (default: the free space, up to 16 GiB); '
+                         'the image is cut to its contents at the end')
+    ap.add_argument('--dry-run', action='store_true', help='check and print the plan only')
+    ap.add_argument('--offline', action='store_true', help='skip the network check (dry run only)')
+    ap.add_argument('--confirm', help='the target\'s name, instead of typing it at the prompt')
+    ap.add_argument('--accept-nvidia-licences', action='store_true')
+    ap.add_argument('--kernel', help='the 5.10 kernel: build-jp5-kernel.sh\'s out/ folder')
+    ap.add_argument('--no-copy-ssh-host-keys', dest='copy_ssh_host_keys', action='store_false',
+                    help='let the new card make its own SSH host keys')
+    ap.add_argument('--no-copy-hostname', dest='copy_hostname', action='store_false',
+                    help='name the new card jetson-nano')
+    ap.add_argument('--no-copy-network', dest='copy_network', action='store_false',
+                    help='leave out the saved network profiles (Wi-Fi passwords included)')
+    ap.add_argument('--root', default='/', help=argparse.SUPPRESS)
+    ap.add_argument('--source-disk', help=argparse.SUPPRESS)
+    ap.add_argument('--skip-network-check', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--nvidia-test-plan', help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    ROOT = args.root
+    if args.nvidia_test_plan:
+        if args.root == '/':
+            ap.error('--nvidia-test-plan is for tests with --root only')
+        apply_test_plan(args.nvidia_test_plan)
+    if args.offline and not args.dry_run:
+        ap.error('--offline is for --dry-run only: the build needs the network')
+    if args.kernel:
+        args.kernel = os.path.abspath(args.kernel)
+
+    if args.list:
+        found = disks()
+        for d in found:
+            say(describe(d))
+        if not found:
+            say('No USB or removable disk found. Plug the new card in through a USB card reader.')
+        return 0
+
+    writing = not args.dry_run
+    if writing and os.geteuid() == 0 and os.environ.get('NANO26_NS') != '1':
+        # Everything mounted from here on lives in a private mount namespace
+        # and disappears with it, whatever happens.
+        os.environ['NANO26_NS'] = '1'
+        os.execvp('unshare', ['unshare', '--mount', '--propagation', 'private', sys.executable,
+                              os.path.abspath(sys.argv[0])] + sys.argv[1:])
+
+    record = open_record()
+    say('nano26-convert: JetPack 4.6.6 to Ubuntu 26.04 on the 5.10 kernel')
+    c = Check()
+    c.result('root', os.geteuid() == 0 or args.root != '/', 'uid %d' % os.geteuid())
+    check_board(c)
+    check_l4t(c)
+    check_boot(c)
+    source = check_source(c, args.source_disk or '/dev/' + SOURCE_DISK)
+    if args.target:
+        ok, target = check_target_device(c, args.target)
+        if ok and writing and args.root != '/':
+            c.result('target', False, 'a stand-in root (--root) only checks a device target; '
+                                      'writing needs --target-image')
+    else:
+        _, target = check_target_image(c, args.target_image, args.size)
+    if args.kernel:
+        check_kernel(c, args.kernel)
+    elif downloads_kernel(args):
+        c.result('kernel', True, '%s, downloaded when writing (pinned SHA-256)' % KERNEL_BUNDLE_URL.rsplit('/', 1)[1])
+    elif writing:
+        c.result('kernel', False, 'give the 5.10 kernel with --kernel DIR (the kernel release is not published yet)')
+    else:
+        say('CHECK kernel   SKIP  dry run without --kernel')
+    check_helpers(c)
+    check_stage2_inputs(c)
+    n = len(accounts())
+    c.result('accounts', n > 0, '%d account%s with a login shell' % (n, '' if n == 1 else 's')
+             + ('' if n else '; the new card would have no login'))
+    check_clock(c)
+    if args.offline or args.skip_network_check:
+        say('CHECK network  SKIP  %s' % ('--offline' if args.offline else 'test run'))
+    else:
+        check_network(c)
+    if source and target and target['bytes'] and source[1][1]['start'] * SECTOR >= target['bytes']:
+        c.result('fit', False, 'the target is smaller than the boot partitions')
+    say('NANO26_CHECKS=%s%s' % ('FAIL ' if c.failed else 'PASS', ' '.join(c.failed)))
+
+    status = 1
+    if not c.failed:
+        print_plan(source, target, args)
+        if args.dry_run:
+            say('NANO26_DRY_RUN=DONE')
+            status = 0
+        elif not accept_licences(args):
+            say('Stopped: NVIDIA\'s terms were not accepted. Nothing was written.')
+        elif not confirm(target, args):
+            say('Stopped: the name did not match. Nothing was written.')
+        elif stage1(source, target, args):
+            say()
+            if target.get('image'):
+                image = target['image']
+                say('The image is ready: %s, %s, with its SHA-256 in %s.sha256.'
+                    % (image, human(os.path.getsize(image)), os.path.basename(image)))
+                say('It holds this system\'s password hashes, SSH keys and Wi-Fi passwords: keep it to')
+                say('yourself. Next (docs/CONVERTER.md, What the user does):')
+                say('  1. On your computer, copy both files from this Nano, where ADDRESS is its')
+                say('     address (hostname -I shows it here):')
+                say("       scp '%s@ADDRESS:%s*' ." % (os.environ.get('SUDO_USER') or 'USER', image))
+                say('  2. Shut this Nano down (sudo poweroff), put this card in the computer\'s card')
+                say('     reader and write %s to the whole card with balenaEtcher (or dd).'
+                    % os.path.basename(image))
+                say('     That replaces JetPack 4 on it.')
+                say('  3. Put the card back in the Nano and power on. Its first boot grows Ubuntu 26.04')
+                say('     to the whole card and installs its packages,')
+            else:
+                say('The new card is ready. Shut down (sudo poweroff), move it from the reader to the')
+                say('Nano\'s card slot and power on. Its first boot installs Ubuntu 26.04\'s packages,')
+            say('shown on the HDMI screen, and restarts by itself. The next boot builds and checks')
+            say('the GPU stack (stage 2; a text login and SSH work meanwhile, as before) and')
+            say('restarts into the desktop\'s login screen; /var/log/nano26/report.txt says what')
+            if target.get('image'):
+                say('passed. Until step 2 this card is unchanged, apart from the image file.')
+            else:
+                say('passed. Putting this card back in the slot is the way back.')
+            say('NANO26_CONVERT=DONE')
+            status = 0
+        else:
+            if target.get('image'):
+                say('No image was made; the running card is unchanged. Run again to start over.')
+            else:
+                say('The new card is not usable; the running card is unchanged. Run again to start over.')
+            say('NANO26_CONVERT=FAIL')
+    if record:
+        print('Record: ' + record)
+    return status
+
+
+if __name__ == '__main__':
+    sys.exit(main())

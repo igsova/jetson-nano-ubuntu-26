@@ -1,0 +1,205 @@
+video: tegra: dc: make the Tegra210 probe work on 5.10
+
+R35's tree still builds JetPack 4's display driver, tegradc, with its
+Tegra210 code, but nothing runs it there. Its probe had five problems on
+this board, four found by reading it against 5.10 and one on the Nano:
+
+- The bandwidth managers start later on 5.10 than on 4.9, after tegradc
+  registers, and the probe turned their -EAGAIN into a lasting error. It
+  now defers until they and HDMI's DDC adapter exist.
+- Any probe error dereferenced NULL in the error path (a structure that
+  only exists on Tegra186 and later).
+- A clock taken with devm_clk_get() was released with clk_put(), so it was
+  put twice.
+- The "disa" power domain was detached only on removal, so a failed probe
+  could never attach it again.
+- That attach used dc->ndev before the probe had set it (NULL).
+
+The error path also kept an interrupt registered with freed memory and
+never tore down the output; it now frees both.
+
+Found: trials 18 to 20. Tested on the Nano: in trial 21 the probe finished
+and drove HDMI at 1920x1080, with the same mode, clocks and supplies as
+4.9.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/video/tegra/dc/dc.c b/nvidia/drivers/video/tegra/dc/dc.c
+--- a/nvidia/drivers/video/tegra/dc/dc.c
++++ b/nvidia/drivers/video/tegra/dc/dc.c
+@@ -41,6 +41,9 @@
+ #include <linux/nvhost.h>
+ #include <linux/clk/tegra.h>
+ #include <linux/platform/tegra/emc_bwmgr.h>
++#include <linux/platform/tegra/isomgr.h>
++#include <linux/i2c.h>
++#include <linux/of.h>
+ #include <uapi/video/tegrafb.h>
+ #include <drm/drm_fixed.h>
+ #include <linux/dma-buf.h>
+@@ -631,6 +634,7 @@ static void __maybe_unused t21x_disp_detach_pd(struct tegra_dc *dc)
+ 
+ 	if (!IS_ERR_OR_NULL(pd->genpd_dev))
+ 		dev_pm_domain_detach(pd->genpd_dev, true);
++	pd->genpd_dev = NULL;
+ }
+ #endif
+ 
+@@ -6358,7 +6362,8 @@ void tegra_disp_clk_put(struct device *dev, struct clk *clk)
+ 		if (tegra_platform_is_silicon())
+ 			devm_clk_put(dev, clk);
+ 	} else {
+-		return clk_put(clk);
++		/* tegra_disp_clk_get() takes T21x clocks with devm_clk_get() */
++		devm_clk_put(dev, clk);
+ 	}
+ }
+ 
+@@ -6388,6 +6393,39 @@ void tegra_get_fb_resource(struct resource *fb_res, int instance)
+ }
+ #endif
+ 
++/*
++ * On 5.10 the bandwidth and isochronous bandwidth managers start at
++ * device_initcall and device_initcall_sync, after this driver registers
++ * (4.9 started them earlier), and registering with either before then fails
++ * with -EAGAIN, which the probe turns into a lasting error. HDMI's DDC
++ * adapter can also come later. A probe that fails after the power domains
++ * and the output are set up does not undo all of it, so wait for these
++ * before touching anything.
++ */
++static int tegra_dc_t21x_probe_ready(struct device_node *np)
++{
++	struct device_node *or_np, *ddc_np;
++	struct i2c_adapter *adap;
++	const char *path;
++
++	if (!tegra_isomgr_init_status())
++		return -EPROBE_DEFER;
++
++	if (of_property_read_string(np, "nvidia,dc-or-node", &path))
++		return 0;
++	or_np = of_find_node_by_path(path);
++	ddc_np = or_np ? of_parse_phandle(or_np, "nvidia,ddc-i2c-bus", 0) : NULL;
++	of_node_put(or_np);
++	if (!ddc_np)
++		return 0;
++	adap = of_find_i2c_adapter_by_node(ddc_np);
++	of_node_put(ddc_np);
++	if (!adap)
++		return -EPROBE_DEFER;
++	put_device(&adap->dev);
++	return 0;
++}
++
+ static int tegra_dc_probe(struct platform_device *ndev)
+ {
+ 	struct tegra_dc *dc;
+@@ -6413,10 +6451,17 @@ static int tegra_dc_probe(struct platform_device *ndev)
+ 	struct resource of_fb_res;
+ 	struct resource of_lut_res;
+ 	int hotplug_init_status = -1;
++	bool t21x_pd_attached = false;
+ 
+ 	if (tegra_dc_is_nvdisplay() && !tegra_dc_common_probe_status())
+ 		return -EPROBE_DEFER;
+ 
++	if (tegra_dc_is_t21x()) {
++		ret = tegra_dc_t21x_probe_ready(np);
++		if (ret)
++			return ret;
++	}
++
+ 	/* Serialize dc device registration */
+ 	mutex_lock(&tegra_dc_registration_lock);
+ 
+@@ -6475,6 +6520,13 @@ static int tegra_dc_probe(struct platform_device *ndev)
+ 	dev_info(&ndev->dev, "Display dc.%p registered with id=%d\n",
+ 			base, ndev->id);
+ 
++	/*
++	 * t21x_disp_attach_pd() below attaches the head's power domain through
++	 * dc->ndev, which is otherwise set only further down; on 5.10 the
++	 * Tegra210 attach then read a NULL device (trial 19).
++	 */
++	dc->ndev = ndev;
++
+ 	if (tegra_dc_is_t21x()) {
+ 		int i;
+ 		char syncpt_name[25];
+@@ -6506,6 +6558,7 @@ static int tegra_dc_probe(struct platform_device *ndev)
+ 				ret = -EINVAL;
+ 				goto err_iounmap_reg;
+ 			}
++			t21x_pd_attached = true;
+ #else
+ 			partition_id_disa = tegra_pd_get_powergate_id(
+ 								tegra_disa_pd);
+@@ -6527,6 +6580,7 @@ static int tegra_dc_probe(struct platform_device *ndev)
+ 				ret = -EINVAL;
+ 				goto err_iounmap_reg;
+ 			}
++			t21x_pd_attached = true;
+ #else
+ 			partition_id_disb = tegra_pd_get_powergate_id(
+ 								tegra_disb_pd);
+@@ -6802,7 +6856,7 @@ static int tegra_dc_probe(struct platform_device *ndev)
+ 						"could not register isomgr. err=%ld\n",
+ 						PTR_ERR(dc->isomgr_handle));
+ 				ret = -ENOENT;
+-				goto err_disable_dc;
++				goto err_free_irq;
+ 			}
+ 			dc->reserved_bw = tegra_dc_calc_min_bandwidth(dc);
+ 			/*
+@@ -6961,6 +7015,7 @@ static int tegra_dc_probe(struct platform_device *ndev)
+ 
+ err_remove_debugfs:
+ 	tegra_dc_remove_debugfs(dc);
++err_free_irq:
+ 	free_irq(irq, dc);
+ err_disable_dc:
+ 	if (dc->ext) {
+@@ -6972,8 +7027,15 @@ static int tegra_dc_probe(struct platform_device *ndev)
+ 		_tegra_dc_disable(dc);
+ 	dc->enabled = false;
+ 	mutex_unlock(&dc->lock);
++	/*
++	 * The output, set up before every jump here, keeps an IRQ and debugfs
++	 * files that point into this dc and its devres memory, both freed
++	 * below (on Tegra210 a later read of tegra_hdmi's hdmi_status oopsed).
++	 */
++	if (tegra_dc_is_t21x() && dc->out_ops && dc->out_ops->destroy)
++		dc->out_ops->destroy(dc);
+ #if defined(CONFIG_TEGRA_ISOMGR)
+-	if (tegra_dc_is_t21x())
++	if (tegra_dc_is_t21x() && !IS_ERR_OR_NULL(dc->isomgr_handle))
+ 		tegra_isomgr_unregister(dc->isomgr_handle);
+ #elif !defined(CONFIG_TEGRA_ISOMGR)
+ 	tegra_disp_clk_put(&ndev->dev, emc_clk);
+@@ -6991,6 +7053,12 @@ static int tegra_dc_probe(struct platform_device *ndev)
+ 	if (tegra_dc_is_nvdisplay())
+ 		tegra_nvdisp_init_once_cleanup(dc);
+ err_iounmap_reg:
++#if IS_ENABLED(CONFIG_PM_GENERIC_DOMAINS) && \
++	KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
++	/* A later probe attaches it again under the same name. */
++	if (t21x_pd_attached)
++		t21x_disp_detach_pd(dc);
++#endif
+ 	iounmap(base);
+ 	kfree(fb_mem);
+ err_release_resource_reg:
+@@ -7003,9 +7071,10 @@ static int tegra_dc_probe(struct platform_device *ndev)
+ 	/*
+ 	 * If a DC probe failed and is not going to be called again,
+ 	 * increment the DC probed count so that the subsequent DCs
+-	 * can get probed.
++	 * can get probed. Only NvDisplay has the common device that keeps
++	 * the count (as on the success path).
+ 	 */
+-	if (ret != -EPROBE_DEFER)
++	if (ret != -EPROBE_DEFER && tegra_dc_is_nvdisplay())
+ 		tegra_dc_common_increment_probed_dc_count();
+ 
+ 	return ret;

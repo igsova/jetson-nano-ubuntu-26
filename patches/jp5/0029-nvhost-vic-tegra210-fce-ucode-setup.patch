@@ -1,0 +1,143 @@
+nvhost: vic: set up the FCE microcode on Tegra210
+
+Tegra210's VIC firmware carries its FCE microcode in its image and needs
+the kernel to say where after each power-on. R32's falcon driver reads the
+image's FCE header and writes SET_FCE_UCODE_SIZE and SET_FCE_UCODE_OFFSET;
+upstream's tegra-drm VIC driver does the same ("Old VIC firmware needs
+kernel help with setting up FCE microcode"). R35 dropped both, so under
+5.10 VIC's firmware halts every job and nvhost times it out after 10 s.
+
+Restore R32's header fields and FCE parsing, skipping images that mark the
+FCE absent as upstream does, and write the two methods at power-on.
+
+Found: on Ubuntu 26.04's own boot, 2026-10-16. The earlier trials had
+passed on what their 4.9 control boot left in VIC (inferred). Sent by hand,
+the two values let the converter pass, and the patch's parser gives the
+same two values on the firmware's header.
+Tested on the Nano: with build #35 (2026-10-17) VIC finished the
+converter's jobs at once with no kernel message, and its pictures were
+right: an exact BT.601 conversion, a bit-exact NV12 round trip and scaling
+within limits.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/video/tegra/host/flcn/flcn.c b/nvidia/drivers/video/tegra/host/flcn/flcn.c
+index 98254b9b4..2b9fbf1cf 100644
+--- a/nvidia/drivers/video/tegra/host/flcn/flcn.c
++++ b/nvidia/drivers/video/tegra/host/flcn/flcn.c
+@@ -306,6 +306,48 @@ static int get_dma_attrs(struct platform_device *dev, unsigned long *attrs)
+ #endif
+ }
+ 
++/*
++ * Tegra210's VIC firmware carries its FCE microcode in the image and needs the
++ * kernel to tell it where that is after each boot (R32.7.6's
++ * flcn_setup_ucode_fce and nvhost_vic_finalize_poweron; upstream tegra-drm's
++ * vic_boot); R35 dropped it. Other images mark the FCE as absent. A bad FCE
++ * header leaves the image loadable without it.
++ */
++static void flcn_setup_ucode_fce(struct platform_device *dev,
++				 struct flcn *v,
++				 const struct firmware *ucode_fw,
++				 struct ucode_v1_flcn *ucode)
++{
++	struct ucode_bin_header_v1_flcn *bin = ucode->bin_header;
++	struct ucode_fce_header_v1_flcn *fce;
++
++	v->fce.size = 0;
++	v->fce.data_offset = 0;
++
++	if (bin->fce_bin_header_offset == FLCN_NO_FCE ||
++	    bin->fce_bin_data_offset == 0 ||
++	    bin->fce_bin_data_offset == FLCN_NO_FCE)
++		return;
++
++	if (bin->fce_bin_header_offset > ucode_fw->size - sizeof(*fce)) {
++		dev_warn(&dev->dev, "fce ucode header outside the image\n");
++		return;
++	}
++	fce = (struct ucode_fce_header_v1_flcn *)
++		((u8 *)v->mapped + bin->fce_bin_header_offset);
++	if (fce->fce_ucode_size == 0 ||
++	    fce->fce_ucode_size > ucode_fw->size ||
++	    bin->fce_bin_data_offset > ucode_fw->size - fce->fce_ucode_size) {
++		dev_warn(&dev->dev, "fce ucode outside the image\n");
++		return;
++	}
++
++	v->fce.size = fce->fce_ucode_size;
++	v->fce.data_offset = bin->fce_bin_data_offset;
++	nvhost_dbg_info("fce ucode: data offset 0x%x size %u",
++			v->fce.data_offset, v->fce.size);
++}
++
+ static int flcn_read_ucode(struct platform_device *dev,
+ 		    const char *fw_name,
+ 		    struct flcn *v)
+@@ -347,6 +389,8 @@ static int flcn_read_ucode(struct platform_device *dev,
+ 		goto clean_up;
+ 	}
+ 
++	flcn_setup_ucode_fce(dev, v, ucode_fw, &ucode);
++
+ 	v->valid = true;
+ 	release_firmware(ucode_fw);
+ 
+@@ -664,6 +708,7 @@ static int nvhost_flcn_deinit_sw(struct platform_device *dev)
+ 
+ int nvhost_vic_finalize_poweron(struct platform_device *pdev)
+ {
++	struct flcn *v;
+ 	int err;
+ 
+ 	err = nvhost_flcn_finalize_poweron(pdev);
+@@ -674,6 +719,18 @@ int nvhost_vic_finalize_poweron(struct platform_device *pdev)
+ 		      NVA0B6_VIDEO_COMPOSITOR_SET_APPLICATION_ID >> 2);
+ 	host1x_writel(pdev, FLCN_UCLASS_METHOD_DATA * 4, 1);
+ 
++	/* Where the FCE microcode is, for Tegra210's VIC firmware */
++	v = get_flcn(pdev);
++	if (v && v->fce.size) {
++		host1x_writel(pdev, FLCN_UCLASS_METHOD_OFFSET * 4,
++			      NVA0B6_VIDEO_COMPOSITOR_SET_FCE_UCODE_SIZE >> 2);
++		host1x_writel(pdev, FLCN_UCLASS_METHOD_DATA * 4, v->fce.size);
++		host1x_writel(pdev, FLCN_UCLASS_METHOD_OFFSET * 4,
++			      NVA0B6_VIDEO_COMPOSITOR_SET_FCE_UCODE_OFFSET >> 2);
++		host1x_writel(pdev, FLCN_UCLASS_METHOD_DATA * 4,
++			      (v->dma_addr + v->fce.data_offset) >> 8);
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/nvidia/drivers/video/tegra/host/flcn/flcn.h b/nvidia/drivers/video/tegra/host/flcn/flcn.h
+index cd8039c5c..1c7b04f79 100644
+--- a/nvidia/drivers/video/tegra/host/flcn/flcn.h
++++ b/nvidia/drivers/video/tegra/host/flcn/flcn.h
+@@ -30,7 +30,10 @@ struct ucode_bin_header_v1_flcn {
+ 	u32 os_bin_header_offset;
+ 	u32 os_bin_data_offset;
+ 	u32 os_bin_size;
+-	u32 reserved[4];
++	u32 fce_bin_header_offset;	/* Tegra210's VIC; FLCN_NO_FCE if none */
++	u32 fce_bin_data_offset;
++	u32 fce_bin_size;
++	u32 reserved;
+ };
+ 
+ struct ucode_os_header_v1_flcn {
+@@ -41,6 +44,14 @@ struct ucode_os_header_v1_flcn {
+ 	u32 num_apps;
+ };
+ 
++struct ucode_fce_header_v1_flcn {
++	u32 fce_ucode_offset;
++	u32 fce_ucode_buffer_size;
++	u32 fce_ucode_size;
++};
++
++#define FLCN_NO_FCE 0xa5a5a5a5
++
+ struct ucode_v1_flcn {
+ 	struct ucode_bin_header_v1_flcn *bin_header;
+ 	struct ucode_os_header_v1_flcn  *os_header;

@@ -1,0 +1,134 @@
+video: tegra: dc: hold the Tegra210 probe (diagnostic, not applied)
+
+From trial 19. Adds a dc.t21x_hold parameter: while it is set the Tegra210
+display probe defers, so a trial kernel boots without the display driver
+and the probe can be started later from user space, once the trial's
+fallback is in place: a crash there restarts into the old kernel, which
+keeps the log. A "probe step:" line marks each stage of the probe.
+
+It found the NULL dereference and the isomgr failure that 0014 and 0016
+fix. Set aside for trial 25, once the probe ran at boot. The other patches
+apply without it.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/video/tegra/dc/dc.c b/nvidia/drivers/video/tegra/dc/dc.c
+--- a/nvidia/drivers/video/tegra/dc/dc.c
++++ b/nvidia/drivers/video/tegra/dc/dc.c
+@@ -6394,6 +6394,16 @@
+ #endif
+ 
+ /*
++ * Diagnostic, trial 19: trial 18's boot stopped before init once this probe
++ * could run at boot. With dc.t21x_hold=1 on the command line the Tegra210 probe
++ * waits until userspace clears this parameter and asks for it through
++ * /sys/bus/platform/drivers_probe, so it runs late in a running system.
++ */
++static bool t21x_hold;
++module_param(t21x_hold, bool, 0644);
++MODULE_PARM_DESC(t21x_hold, "Defer the Tegra210 probe while set");
++
++/*
+  * On 5.10 the bandwidth and isochronous bandwidth managers start at
+  * device_initcall and device_initcall_sync, after this driver registers
+  * (4.9 started them earlier), and registering with either before then fails
+@@ -6408,6 +6418,8 @@
+ 	struct i2c_adapter *adap;
+ 	const char *path;
+ 
++	if (READ_ONCE(t21x_hold))
++		return -EPROBE_DEFER;
+ 	if (!tegra_isomgr_init_status())
+ 		return -EPROBE_DEFER;
+ 
+@@ -6460,6 +6472,7 @@
+ 		ret = tegra_dc_t21x_probe_ready(np);
+ 		if (ret)
+ 			return ret;
++		dev_info(&ndev->dev, "probe step: start\n");
+ 	}
+ 
+ 	/* Serialize dc device registration */
+@@ -6559,6 +6572,7 @@
+ 				goto err_iounmap_reg;
+ 			}
+ 			t21x_pd_attached = true;
++			dev_info(&ndev->dev, "probe step: power domains attached\n");
+ #else
+ 			partition_id_disa = tegra_pd_get_powergate_id(
+ 								tegra_disa_pd);
+@@ -6732,6 +6746,7 @@
+ 
+ 	tegra_dc_feature_register(dc);
+ 
++	dev_info(&ndev->dev, "probe step: setting output\n");
+ 	if (dc->pdata->default_out) {
+ 		if (dc->pdata->default_out->hotplug_init) {
+ 			ret = dc->pdata->default_out->hotplug_init(
+@@ -6751,6 +6766,7 @@
+ 			"No default output specified.  Leaving output disabled.\n");
+ 	}
+ 	dc->mode_dirty = false; /* ignore changes tegra_dc_set_out has done */
++	dev_info(&ndev->dev, "probe step: output set\n");
+ 
+ 	if (!dc->out) {
+ 		ret = -EINVAL;
+@@ -6820,6 +6836,7 @@
+ 		}
+ 	}
+ 
++	dev_info(&ndev->dev, "probe step: registering ext\n");
+ 	dc->ext = tegra_dc_ext_register(ndev, dc);
+ 	if (IS_ERR_OR_NULL(dc->ext)) {
+ 		dev_warn(&ndev->dev, "Failed to enable Tegra DC extensions.\n");
+@@ -6834,6 +6851,7 @@
+ 		goto err_disable_dc;
+ 	}
+ 	disable_dc_irq(dc);
++	dev_info(&ndev->dev, "probe step: irq ready\n");
+ 
+ 	/* Enable async suspend/resume to reduce LP0 latency */
+ 	device_enable_async_suspend(&ndev->dev);
+@@ -6908,6 +6926,7 @@
+ 					   || !dc->mode.v_active))
+ 			tegra_dc_set_fb_mode(dc, &tegra_dc_vga_mode, false);
+ 
++		dev_info(&ndev->dev, "probe step: registering fb\n");
+ 		ret = tegra_dc_io_start(dc);
+ 		dc->fb = tegra_fb_register(ndev, dc, dc->pdata->fb, fb_mem);
+ 		if (!ret)
+@@ -6947,6 +6966,7 @@
+ 		}
+ 	}
+ 
++	dev_info(&ndev->dev, "probe step: hotplug init\n");
+ 	if (dc->out_ops && dc->out_ops->hotplug_init)
+ 		hotplug_init_status = dc->out_ops->hotplug_init(dc);
+ 
+@@ -6959,8 +6979,10 @@
+ 	}
+ 
+ 	if (dc->pdata->flags & TEGRA_DC_FLAG_ENABLED) {
++		dev_info(&ndev->dev, "probe step: enabling head\n");
+ 		_tegra_dc_set_default_videomode(dc);
+ 		dc->enabled = _tegra_dc_enable(dc);
++		dev_info(&ndev->dev, "probe step: head enabled=%d\n", dc->enabled);
+ 
+ #if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
+ #if IS_ENABLED(CONFIG_PM_GENERIC_DOMAINS)
+@@ -6991,6 +7013,7 @@
+ 			!(dc->out_ops && dc->out_ops->detect))
+ 		tegra_dc_powergate_locked(dc);
+ 
++	dev_info(&ndev->dev, "probe step: connected=%d\n", dc->connected);
+ 	tegra_dc_create_sysfs(&dc->ndev->dev);
+ 
+ 	/*
+@@ -7011,6 +7034,7 @@
+ 		tegra_dc_common_increment_probed_dc_count();
+ 
+ 	mutex_unlock(&tegra_dc_registration_lock);
++	dev_info(&ndev->dev, "probe step: done\n");
+ 	return 0;
+ 
+ err_remove_debugfs:

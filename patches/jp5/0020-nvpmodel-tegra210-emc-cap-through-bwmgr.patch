@@ -1,0 +1,38 @@
+nvpmodel: tegra210: cap the memory clock through bwmgr
+
+nvpmodel caps the memory clock for each power mode through
+/sys/kernel/nvpmodel_emc_cap. R32's driver registers a bandwidth manager
+client on every chip; R35's does so only on Tegra194 and otherwise asks the
+interconnect framework for a path Tegra210 does not provide. Its init
+failed, the sysfs file never appeared, and the nvpmodel service failed. Its
+error path also called icc_put() on an error pointer, which is the call
+trace logged in every 5.10 boot until this patch.
+
+Tegra210 now takes the Tegra194 path; the bandwidth manager works on
+Tegra210 from 0010.
+
+Found: trial 17. Tested on the Nano: in trial 27 the driver initialized
+with no call trace; with the corrected nvpmodel config line (see
+README.md) the 5W and MAXN modes set the same limits as under 4.9 in
+trial 29.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/nvpmodel/nvpmodel_emc_cap.c b/nvidia/drivers/nvpmodel/nvpmodel_emc_cap.c
+index 2f676c139..bcfef27e3 100644
+--- a/nvidia/drivers/nvpmodel/nvpmodel_emc_cap.c
++++ b/nvidia/drivers/nvpmodel/nvpmodel_emc_cap.c
+@@ -217,7 +217,12 @@ static int __init nvpmodel_clk_cap_init(void)
+ 		goto exit;
+ 	}
+ 
+-	if (tegra_get_chip_id() == TEGRA194) {
++	/*
++	 * Tegra210 has no interconnect provider here: cap the EMC through the
++	 * bandwidth manager, as R32's driver did on every chip.
++	 */
++	if (tegra_get_chip_id() == TEGRA194 ||
++	    tegra_get_chip_id() == TEGRA210) {
+ #if IS_ENABLED(CONFIG_TEGRA_BWMGR)
+ 		bwmgr_handle =
+ 			tegra_bwmgr_register(TEGRA_BWMGR_CLIENT_NVPMODEL);

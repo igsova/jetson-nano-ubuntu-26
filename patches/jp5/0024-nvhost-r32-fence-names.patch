@@ -1,0 +1,45 @@
+nvhost: accept R32's fence names without CONFIG_SYNC
+
+5.10 has no Android sync framework, so R35 makes nvhost's fences sync_file
+fences, and its handler for NVHOST_IOCTL_CTRL_SYNC_FENCE_SET_NAME works
+only with CONFIG_SYNC. JetPack 4's video converter names its fences and
+stopped on the refusal.
+
+Without CONFIG_SYNC the request now checks that the fd holds a fence made
+only of host1x syncpoints, the check R32 made, and returns 0. The name is
+not kept: a sync_file fence has none a driver can set, and R32 used it
+only in debug output.
+
+Found: trial 34. Tested on the Nano: in trial 35 the converter's set-name
+request succeeded.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/video/tegra/host/host1x/host1x.c b/nvidia/drivers/video/tegra/host/host1x/host1x.c
+index efacb138c..1ecc48b02 100644
+--- a/nvidia/drivers/video/tegra/host/host1x/host1x.c
++++ b/nvidia/drivers/video/tegra/host/host1x/host1x.c
+@@ -318,6 +318,23 @@ static int nvhost_ioctl_ctrl_sync_fence_set_name(
+ 
+ 	err = nvhost_sync_fence_set_name(args->fence_fd, name);
+ 	return err;
++#elif IS_ENABLED(CONFIG_TEGRA_GRHOST_SYNC)
++	/*
++	 * JetPack 4's (R32) video converter names the fences it creates; on
++	 * the Nano this request failed just before the converter stopped.
++	 * The sync_file fences used without CONFIG_SYNC keep no name of
++	 * their own, and the name only labelled the fence in sync debug
++	 * output, so check that the fd holds a syncpoint fence, as R32's
++	 * nvhost_sync_fdget() did, and leave the name out.
++	 */
++	struct nvhost_fence *fence = nvhost_fence_get(args->fence_fd);
++
++	if (!fence) {
++		nvhost_err(&ctx->dev->dev->dev, "failed to get fence");
++		return -EINVAL;
++	}
++	nvhost_fence_put(fence);
++	return 0;
+ #else
+ 	nvhost_err(&ctx->dev->dev->dev, "operation not supported");
+ 	return -EINVAL;

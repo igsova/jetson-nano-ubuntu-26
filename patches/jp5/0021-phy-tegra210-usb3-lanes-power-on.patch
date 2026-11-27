@@ -1,0 +1,68 @@
+phy: tegra: xusb-tegra210: power on USB 3 lanes named "xusb"
+
+Under 5.10 the onboard hub's USB 3 half never appeared, with no error. The
+pad setup for a USB 3 lane runs only when the lane's function is
+"usb3-ss", upstream's name; R35 names that function "xusb" on Tegra210, as
+R32's device trees do, so the setup never ran. The five checks now test for
+the name the lanes carry. The register value is the same either way.
+
+Tested on the Nano: in trial 30 the hub's USB 3 half (0bda:0411) came up at
+SuperSpeed, as under 4.9.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/phy/tegra/xusb-tegra210.c b/drivers/phy/tegra/xusb-tegra210.c
+index 4792693..4ee3ffa 100644
+--- a/drivers/phy/tegra/xusb-tegra210.c
++++ b/drivers/phy/tegra/xusb-tegra210.c
+@@ -736,7 +736,7 @@ static int tegra210_sata_uphy_enable(struct tegra_xusb_padctl *padctl)
+ 	if (tegra210_plle_hw_sequence_is_enabled())
+ 		goto skip_pll_init;
+ 
+-	usb = tegra_xusb_lane_check(lane, "usb3-ss");
++	usb = tegra_xusb_lane_check(lane, "xusb");
+ 
+ 	err = clk_prepare_enable(sata->pll);
+ 	if (err < 0)
+@@ -2847,7 +2847,13 @@ static int tegra210_pcie_phy_power_on(struct phy *phy)
+ 							tegra210_usb3_lane_map(lane));
+ 	}
+ 
+-	if (tegra_xusb_lane_check(lane, "usb3-ss"))
++	/*
++	 * R35 names these lanes' USB3 function "xusb", as R32's device trees do
++	 * (tegra210_pcie_functions, tegra210_usb3_port_map()), where upstream
++	 * names it "usb3-ss". Checking for "usb3-ss" never matched, so the USB3
++	 * pad was never set up and no SuperSpeed device connected.
++	 */
++	if (tegra_xusb_lane_check(lane, "xusb"))
+ 		err = tegra210_usb3_phy_power_on(phy);
+ 
+ 	mutex_unlock(&padctl->lock);
+@@ -2862,7 +2868,7 @@ static int tegra210_pcie_phy_power_off(struct phy *phy)
+ 
+ 	mutex_lock(&padctl->lock);
+ 
+-	if (tegra_xusb_lane_check(lane, "usb3-ss"))
++	if (tegra_xusb_lane_check(lane, "xusb"))
+ 		err = tegra210_usb3_phy_power_off(phy);
+ 
+ 	mutex_unlock(&padctl->lock);
+@@ -3031,7 +3037,7 @@ static int tegra210_sata_phy_power_on(struct phy *phy)
+ 				tegra210_usb3_lane_map(lane));
+ 	}
+ 
+-	if (tegra_xusb_lane_check(lane, "usb3-ss"))
++	if (tegra_xusb_lane_check(lane, "xusb"))
+ 		err = tegra210_usb3_phy_power_on(phy);
+ 
+ 	mutex_unlock(&padctl->lock);
+@@ -3046,7 +3052,7 @@ static int tegra210_sata_phy_power_off(struct phy *phy)
+ 
+ 	mutex_lock(&padctl->lock);
+ 
+-	if (tegra_xusb_lane_check(lane, "usb3-ss"))
++	if (tegra_xusb_lane_check(lane, "xusb"))
+ 		err = tegra210_usb3_phy_power_off(phy);
+ 
+ 	mutex_unlock(&padctl->lock);

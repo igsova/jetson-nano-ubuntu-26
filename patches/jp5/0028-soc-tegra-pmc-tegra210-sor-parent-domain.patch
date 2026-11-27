@@ -1,0 +1,90 @@
+soc/tegra: pmc: sor is the parent of the display domains on Tegra210
+
+Under 5.10 tegradc holds the sor domain only around short uses, never for
+the running head, so a SOR domain that can power off (0027) would power off
+under it. R32's 4.9 powergate driver powers the SOR partition on before
+DISA, DISB or VENC and off after the last of them.
+
+Make sor the genpd parent of dis, disb and venc on Tegra210, as R35 already
+does for NVJPG and NVDEC.
+
+Tested on the Nano (with 0027): in trial 37 sor and dis were off 2 s after
+a blank and on after the unblank, with no reset error.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/soc/tegra/pmc.c b/drivers/soc/tegra/pmc.c
+index 03e20ee8d..072fd6967 100644
+--- a/drivers/soc/tegra/pmc.c
++++ b/drivers/soc/tegra/pmc.c
+@@ -698,6 +698,9 @@ struct tegra_pmc {
+ 
+ 	struct tegra_powergate *nvjpg_pg;
+ 	struct tegra_powergate *nvdec_pg;
++
++	struct tegra_powergate *sor_pg;
++	struct tegra_powergate *sor_sub_pg[3];
+ };
+ 
+ static struct tegra_pmc *pmc = &(struct tegra_pmc) {
+@@ -1922,6 +1925,15 @@ static int tegra_powergate_add(struct tegra_pmc *pmc, struct device_node *np)
+ 	if (pg->id == TEGRA_POWERGATE_NVDEC)
+ 		pmc->nvdec_pg = pg;
+ 
++	if (pg->id == TEGRA_POWERGATE_SOR)
++		pmc->sor_pg = pg;
++	else if (pg->id == TEGRA_POWERGATE_DIS)
++		pmc->sor_sub_pg[0] = pg;
++	else if (pg->id == TEGRA_POWERGATE_DISB)
++		pmc->sor_sub_pg[1] = pg;
++	else if (pg->id == TEGRA_POWERGATE_VENC)
++		pmc->sor_sub_pg[2] = pg;
++
+ 	dev_dbg(dev, "added PM domain %s\n", pg->genpd.name);
+ 
+ 	return 0;
+@@ -1947,6 +1959,35 @@ static int tegra_powergate_add(struct tegra_pmc *pmc, struct device_node *np)
+ 	return err;
+ }
+ 
++/*
++ * On Tegra210 the display heads (DIS, DISB) and VENC need the SOR partition:
++ * R32's 4.9 powergate driver (powergate-t21x.c) powers SOR on before any of
++ * them and off after the last, and genpd does the same for a parent domain.
++ * Without it the SOR partition follows only tegradc's short SOR and DPAUX
++ * uses, and would power off under a running head once it can.
++ */
++static void tegra210_powergate_add_sor_subdomains(struct tegra_pmc *pmc)
++{
++	unsigned int i;
++	int err;
++
++	if (!pmc->sor_pg ||
++	    !of_device_is_compatible(pmc->dev->of_node, "nvidia,tegra210-pmc"))
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(pmc->sor_sub_pg); i++) {
++		struct tegra_powergate *sub = pmc->sor_sub_pg[i];
++
++		if (!sub)
++			continue;
++
++		err = pm_genpd_add_subdomain(&pmc->sor_pg->genpd, &sub->genpd);
++		if (err < 0)
++			dev_err(pmc->dev, "failed to add %s to %s: %d\n",
++				sub->genpd.name, pmc->sor_pg->genpd.name, err);
++	}
++}
++
+ static int tegra_powergate_init(struct tegra_pmc *pmc,
+ 				struct device_node *parent)
+ {
+@@ -1972,6 +2013,8 @@ static int tegra_powergate_init(struct tegra_pmc *pmc,
+ 		pm_genpd_add_subdomain(&pmc->nvjpg_pg->genpd,
+ 				&pmc->nvdec_pg->genpd);
+ 
++	tegra210_powergate_add_sor_subdomains(pmc);
++
+ 	return err;
+ }
+ 

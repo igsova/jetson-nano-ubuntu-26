@@ -1,0 +1,36 @@
+# Added on top of the R35.6 tegra_defconfig for the Jetson Nano trial.
+# The release string must be 5.10.216-tegra (modules and the trial scripts check it).
+CONFIG_LOCALVERSION="-tegra"
+# Keep a RAM log across a reset (record sizes are in the Nano trial device tree).
+CONFIG_PSTORE_RAM=y
+# No fuse-burning interface in a trial kernel: eFuse writes are permanent.
+# CONFIG_TEGRA_FUSE_BURN is not set
+# Trial 15: CPU frequency scaling. tegra124-cpufreq moves the CPU from the
+# bootloader's PLL_X clock to the DFLL, and cpufreq-dt then scales it along the
+# DFLL's voltage table (trials 5 to 14 left it out, so the CPU stayed on PLL_X).
+CONFIG_ARM_TEGRA124_CPUFREQ=y
+# Trial 12: 5.10's Tegra210 EMC driver, reading R32's EMC table nodes (patch
+# 0009). Built in: it calls tegra_read_ram_code(), which modules cannot.
+CONFIG_TEGRA210_EMC=y
+# Trial 28: JetPack 4's fan driver. R32's fan node (shared_data, active_pwm)
+# is in NVIDIA's own Tegra pwm_fan format, which R35 still carries in
+# nvidia/drivers/thermal but does not enable; upstream's hwmon pwm-fan, which
+# R35 builds instead, rejected it ("Wrong Data", -22), so 5.10 had no fan
+# device and no fan_profile for nvpmodel. Both match "pwm-fan", so upstream's
+# is left out. A module, so a fault in it comes after the trial's init has
+# put the normal boot entry back.
+CONFIG_PWM_FAN=m
+# CONFIG_SENSORS_PWM_FAN is not set
+# Trial 30: users may read the kernel log, as under JetPack 4's 4.9 kernel
+# (R35's tegra_defconfig restricts dmesg to root).
+# CONFIG_SECURITY_DMESG_RESTRICT is not set
+# Trial 35: syscall trace events, so the trial check can record which ioctl
+# requests JetPack 4's video converter makes under 5.10 and what each returns.
+CONFIG_FTRACE_SYSCALLS=y
+# Ubuntu 26.04 on 5.10 (owner's choice, 2026-10-15): two options systemd 259
+# recommends that R35's tegra_defconfig leaves off. cgroup BPF lets systemd
+# enforce units' device access (DeviceAllow=, DevicePolicy=) and IP filters
+# under cgroup v2, the only hierarchy systemd 258 and later support; pressure
+# stall information is what systemd-oomd reads.
+CONFIG_CGROUP_BPF=y
+CONFIG_PSI=y

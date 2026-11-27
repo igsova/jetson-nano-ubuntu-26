@@ -1,0 +1,19 @@
+# nano26-convert's stage 2 (docs/CONVERTER.md): builds, installs and checks
+# the GPU stack and sets up the desktops, once, on the new card's first boot
+# with systemd; nano26-first-boot enables it and it disables itself when done.
+# Its steps show on the screen and in journalctl -u nano26-stage2.
+[Unit]
+Description=nano26 stage 2: the GPU stack and the desktops
+After=multi-user.target
+ConditionPathExists=/var/lib/nano26/first-boot.done
+ConditionPathExists=!/var/lib/nano26/stage2.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/nano26/stage2
+TimeoutStartSec=infinity
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

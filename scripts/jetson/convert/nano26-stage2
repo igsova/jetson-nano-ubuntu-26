@@ -1,0 +1,429 @@
+#!/bin/bash
+# nano26-stage2: the GPU stack and the desktops, on the new card's first boot
+# with systemd (docs/CONVERTER.md, Stage 2).
+#
+# nano26-convert installs this as /usr/lib/nano26/stage2, the repository files
+# it runs in /usr/lib/nano26/repo (checked against the SHA256SUMS there) and
+# NVIDIA's packages in a copy of NVIDIA's repositories in
+# /var/lib/nano26/mirror, laid out as the servers are, with mirror/sets/*.txt
+# listing what each step takes. nano26-first-boot enables
+# nano26-stage2.service, which runs this once multi-user.target is reached.
+# No network is needed. The builders and checks run as the owner account
+# (owner= in /var/lib/nano26/settings, the account that ran the converter),
+# the installs as root, as on the reference card. The steps, in order:
+#   l4t-build      build-nano-l4t-debs.py --release r35 (the nano-l4t driver
+#                  set), --set video --release r32 --cc gcc-11 and --set video
+#                  --release r35 --cc gcc-11, from the mirror's l4t set;
+#   l4t-install    those seven packages and NVIDIA's CUDA 11.4 runtime
+#                  libraries, cuDNN 8.6 and TensorRT 8.5 (install-u26-r35.sh's
+#                  19 pins, the mirror's install set) in one apt transaction
+#                  that installs exactly those and removes nothing; then
+#                  udev's new rules applied to the GPU's device nodes;
+#   r35-check      check-u26-r35.sh as the owner;
+#   cuda12-build   build-nano-cuda12-debs.py --mirror as the owner;
+#   cuda12-install its install-nano-cuda12.sh, which runs check-nano-cuda12.sh;
+#   trt82-build    package-trt82.sh as the owner, from the mirror's trt82 set;
+#   trt82-install  install-trt82.sh;
+#   board          enable-u26-fan.sh and enable-hdmi-wake.sh;
+#   desktop        add-u26-desktop.sh's, add-u26-gpu-desktop.sh's and
+#                  add-u26-unity.sh's settings (zram swap is the converter's),
+#                  and LightDM enabled;
+#   video          probe-l4t-video.sh --installed r35, then r32, as the owner.
+# A set's packages leave the mirror once the step that installs them passes.
+# Each step that passes is marked in /var/lib/nano26/stage2 and is not run
+# again. When one fails, the screen, the journal and
+# /var/log/nano26/stage2.log say which; the card stays at the text login (SSH
+# works) and the next boot, or sudo systemctl start nano26-stage2, retries
+# from that step. When all pass it writes /var/log/nano26/report.txt, removes
+# the mirror and its build folders, makes the desktop the default, disables
+# the service and restarts. The last line is NANO26_STAGE2=DONE or FAILED.
+#
+# Outside systemd (a test in a chroot) it runs the same steps, but neither
+# checks the kernel, applies udev's rules nor restarts.
+# shellcheck disable=SC2329  # the step_ functions run by name, from STEPS
+set -u
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root DEBIAN_FRONTEND=noninteractive
+KERNEL=5.10.216-tegra
+NANO_L4T=35.6.5-20260701022834+u26.1
+XSERVER='/usr/lib/nano-xorg/Xorg -nolisten tcp -modulepath /usr/lib/nano-xorg/modules -config /etc/X11/nano-xorg.conf -configdir /etc/X11/nano-xorg.conf.d'
+WALLPAPER=/usr/share/backgrounds/Resolute_Raccoon_Wallpaper_Dimmed_3840x2160.png
+FAVORITES="['application://nemo.desktop', 'application://xfce4-terminal.desktop', \
+'application://org.xfce.mousepad.desktop', 'application://unity-control-center.desktop', \
+'unity://running-apps', 'unity://expo-icon', 'unity://devices']"
+STEPS=(l4t-build l4t-install r35-check cuda12-build cuda12-install trt82-build trt82-install board desktop video)
+declare -A ABOUT=(
+    [l4t-build]='building the NVIDIA driver packages and both video converters'
+    [l4t-install]='installing the GPU driver set, CUDA 11.4, cuDNN 8.6 and TensorRT 8.5'
+    [r35-check]='checking CUDA, OpenGL ES, Vulkan and TensorRT'
+    [cuda12-build]='building CUDA 12.6 with cuDNN 9 (the longest step)'
+    [cuda12-install]='installing and checking CUDA 12.6'
+    [trt82-build]='packaging TensorRT 8.2'
+    [trt82-install]='installing TensorRT 8.2 as the default, with 8.5 beside it'
+    [board]='the fan and the HDMI wake helper'
+    [desktop]='the desktop settings: Xfce, Unity, LightDM on the GPU'
+    [video]='checking both video converters through VIC'
+)
+state=/var/lib/nano26
+repo=/usr/lib/nano26/repo
+mirror=$state/mirror
+build=$state/build
+marks=$state/stage2
+log=/var/log/nano26/stage2.log
+report=/var/log/nano26/report.txt
+systemd=0
+[ -d /run/systemd/system ] && systemd=1
+
+mkdir -p /var/log/nano26 "$marks"
+touch "$log"
+
+say() {
+    printf '%s nano26 stage 2: %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$log"
+}
+
+note() { printf '%s\n' "$*" >> "$report"; }
+
+fail() {
+    say "FAILED: $*"
+    note "FAILED $*"
+    say 'The log is /var/log/nano26/stage2.log. This card keeps its text login and SSH;'
+    say 'the next boot retries from this step (or: sudo systemctl start nano26-stage2).'
+    say 'NANO26_STAGE2=FAILED'
+    exit 1
+}
+
+# A command's output goes to the log; on failure its last lines also show.
+run() {
+    local from
+    from=$(wc -l < "$log")
+    printf '$ %s\n' "$*" >> "$log"
+    "$@" >> "$log" 2>&1 || { tail -n "+$((from + 1))" "$log" | tail -n 25; return 1; }
+}
+
+# The same, as the owner account, with a clean environment, as install-u26-r35.sh runs its check.
+as_owner() {
+    run runuser -u "$owner" -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$home" USER="$owner" \
+        LOGNAME="$owner" LANG=C.UTF-8 "$@"
+}
+
+# The last result line (NAME=PASS or FAIL ...) a tool wrote to the log in this step, into the report.
+log_start=0
+result() { tail -n "+$((log_start + 1))" "$log" | grep -E "^$1=" | tail -n 1 | sed 's/^/  /' >> "$report"; }
+
+setting() { sed -n "s/^$1=//p" "$state/settings"; }
+
+# A set's .debs as links in a new folder FOLDER (by file name), with SHA256SUMS
+# there; the mirror's copies are checked against the set first.
+gather() {  # SET FOLDER
+    local digest rel
+    (cd "$mirror" && sha256sum --quiet -c "sets/$1.txt") >> "$log" 2>&1 || { say "the mirror's $1 set does not match"; return 1; }
+    rm -rf "$2" && install -d -m 0755 -o "$owner" -g "$group" "$2" || return 1
+    : > "$2/SHA256SUMS"
+    while read -r digest rel; do
+        ln -s "$mirror/$rel" "$2/${rel##*/}" || return 1
+        printf '%s  %s\n' "$digest" "${rel##*/}" >> "$2/SHA256SUMS"
+    done < "$mirror/sets/$1.txt"
+}
+
+# A delivery folder: repository files side by side, with their SHA256SUMS.
+deliver() {  # FOLDER FILE...
+    local folder=$1 rel
+    shift
+    rm -rf "$folder" && install -d -m 0755 -o "$owner" -g "$group" "$folder" || return 1
+    for rel in "$@"; do
+        install -m 0644 "$repo/$rel" "$folder/${rel##*/}" || return 1
+    done
+    (cd "$folder" && sha256sum -- * > SHA256SUMS)
+}
+
+# Mirror files of SETs that no step still to run needs.
+drop_sets() {
+    local set keep=() other rel
+    for other in "$mirror"/sets/*.txt; do
+        [[ " $* " == *" $(basename "$other" .txt) "* ]] || keep+=("$other")
+    done
+    for set in "$@"; do
+        [ -f "$mirror/sets/$set.txt" ] || continue
+        while read -r _ rel; do
+            grep -qsF "  $rel" "${keep[@]}" /dev/null || rm -f "$mirror/$rel"
+        done < "$mirror/sets/$set.txt"
+        rm -f "$mirror/sets/$set.txt"
+    done
+}
+
+# --- The steps.
+
+step_l4t_build() {
+    gather l4t "$build/l4t-inputs" || return 1
+    rm -rf "$build/l4t-r35" "$build/video-r32" "$build/video-r35"
+    local tool=$repo/scripts/host/build-nano-l4t-debs.py
+    as_owner python3 "$tool" --release r35 "$build/l4t-inputs" "$build/l4t-r35" && result NANO_L4T_DEBS \
+        && as_owner python3 "$tool" --set video --release r32 --cc gcc-11 "$build/l4t-inputs" "$build/video-r32" \
+        && result NANO_L4T_DEBS \
+        && as_owner python3 "$tool" --set video --release r35 --cc gcc-11 "$build/l4t-inputs" "$build/video-r35" \
+        && result NANO_L4T_DEBS
+}
+
+step_l4t_install() {
+    local debs=() names=() deb name version todo=() action rest
+    (cd "$mirror" && sha256sum --quiet -c sets/install.txt) >> "$log" 2>&1 \
+        || { say "the mirror's install set does not match"; return 1; }
+    for dir in l4t-r35 video-r32 video-r35; do
+        (cd "$build/$dir" && sha256sum --quiet -c SHA256SUMS) >> "$log" 2>&1 \
+            || { say "$dir's packages do not match their SHA256SUMS"; return 1; }
+        debs+=("$build/$dir"/*.deb)
+    done
+    while read -r _ rel; do debs+=("$mirror/$rel"); done < "$mirror/sets/install.txt"
+    for deb in "${debs[@]}"; do
+        name=$(dpkg-deb -f "$deb" Package) && version=$(dpkg-deb -f "$deb" Version) || return 1
+        [[ " ${names[*]} " != *" $name "* ]] || { say "two packages of $name"; return 1; }
+        names+=("$name")
+        [[ $name != nano-l4t-* || $name == nano-l4t-r3?-video || $version == "$NANO_L4T" ]] \
+            || { say "$name is $version, not $NANO_L4T"; return 1; }
+        [[ $(dpkg-query -W -f '${db:Status-Abbrev} ${Version}' "$name" 2> /dev/null) == "ii  $version" ]] \
+            || todo+=("$deb")
+    done
+    say "${#debs[@]} packages: the nano-l4t driver set and both video converters, CUDA 11.4's libraries, cuDNN 8.6 and TensorRT 8.5; ${#todo[@]} to install"
+    if (( ${#todo[@]} )); then
+        # No --no-download: with it apt 3.2 refuses .deb files ("Pathname to
+        # install is not absolute"). The plan check below keeps it offline.
+        apt=(apt-get --no-install-recommends -o Dpkg::Options::=--force-confold)
+        "${apt[@]}" -s install "${todo[@]}" > "$build/plan.txt" 2>&1 \
+            || { tail -n 20 "$build/plan.txt"; say 'apt cannot plan the install'; return 1; }
+        cat "$build/plan.txt" >> "$log"
+        # Exactly those packages: nothing else installed or upgraded, nothing removed.
+        local unexpected=()
+        while read -r action name rest; do
+            case $action in
+                Inst) [[ " ${names[*]} " == *" $name "* ]] || unexpected+=("install $name") ;;
+                Remv|Purg) unexpected+=("remove $name") ;;
+            esac
+        done < <(grep -E '^(Inst|Remv|Purg) ' "$build/plan.txt")
+        (( ${#unexpected[@]} == 0 )) || { say "apt's plan also does: ${unexpected[*]}"; return 1; }
+        run "${apt[@]}" --yes install "${todo[@]}" || return 1
+    fi
+    run ldconfig || return 1
+    [ -z "$(dpkg --audit)" ] || { say 'dpkg --audit reports unfinished packages'; return 1; }
+    if (( systemd )); then
+        # The GPU's and the display's device nodes, as the new rules set them (as
+        # install-u26-r35.sh). The nodes were made at this boot, before the rules:
+        # NVIDIA's Vulkan driver opens /dev/tegra_dc_ctrl, and crashed when that
+        # was still root's only (on the Nano, 2026-10-22).
+        run udevadm control --reload
+        run udevadm trigger --action=change --subsystem-match=nvidia-gpu-v2 --subsystem-match=nvidia-gpu-v2-power
+        run udevadm trigger --action=change --sysname-match='nvhost*' --sysname-match=nvmap \
+            --sysname-match='tegra_dc*'
+        udevadm settle --timeout=30 || say 'udev did not settle in 30 s'
+    fi
+    drop_sets l4t install
+}
+
+step_r35_check() {
+    deliver "$build/check-r35" scripts/jetson/check-u26-r35.sh tests/cuda/cuda11_probe.py tests/gl/egl_probe.py \
+        tests/vk/vk_probe.py tests/trt/trt_check.py tests/trt/tiny_cnn.onnx tests/trt/expected.json || return 1
+    as_owner bash "$build/check-r35/check-u26-r35.sh"
+    local status=$?
+    result U26_R35_CHECK
+    return "$status"
+}
+
+step_cuda12_build() {
+    rm -rf "$build/cuda12"
+    as_owner python3 "$repo/scripts/host/build-nano-cuda12-debs.py" --key "$mirror/keys/jetson-ota-public.asc" \
+        --mirror "$mirror" "$build/cuda12"
+    local status=$?
+    result NANO_CUDA12_DEBS
+    return "$status"
+}
+
+step_cuda12_install() {
+    run env SUDO_USER="$owner" bash "$build/cuda12/nano/install-nano-cuda12.sh"
+    local status=$?
+    result NANO_CUDA12_INSTALL
+    (( status == 0 )) || return 1
+    drop_sets cuda12
+    rm -rf "$build/cuda12/sources"
+}
+
+step_trt82_build() {
+    gather trt82 "$build/trt82-inputs" || return 1
+    as_owner bash "$repo/scripts/jetson/yolo/package-trt82.sh" "$build/trt82-inputs"
+    local status=$?
+    result TRT82_PACKAGE
+    return "$status"
+}
+
+step_trt82_install() {
+    run env SUDO_USER="$owner" bash "$repo/scripts/jetson/yolo/install-trt82.sh" "$home/nano-trt82-package"
+    local status=$?
+    result TRT82_INSTALL
+    (( status == 0 )) || return 1
+    drop_sets trt82
+}
+
+step_board() {
+    run bash "$repo/scripts/jetson/enable-u26-fan.sh" && result U26_FAN \
+        && run bash "$repo/scripts/jetson/enable-hdmi-wake.sh" && result HDMI_WAKE_FIX
+}
+
+# add-u26-desktop.sh's, add-u26-gpu-desktop.sh's and add-u26-unity.sh's
+# settings, as the reference card has them (tests/convert compares the texts).
+step_desktop() {
+    install -d -m 0755 /etc/X11/xorg.conf.d /etc/lightdm/lightdm.conf.d || return 1
+    # LightDM enumerates this at start and warns when it is missing.
+    install -d -m 0755 -o lightdm -g lightdm /var/lib/lightdm/data || return 1
+    cat > /etc/X11/xorg.conf.d/20-jetson-framebuffer.conf <<'EOF'
+Section "Device"
+    Identifier "Jetson framebuffer"
+    Driver "fbdev"
+    Option "fbdev" "/dev/fb0"
+    Option "ShadowFB" "true"
+EndSection
+Section "Screen"
+    Identifier "Jetson screen"
+    Device "Jetson framebuffer"
+    DefaultDepth 24
+EndSection
+EOF
+    cat > /etc/lightdm/lightdm.conf.d/50-jetson-desktop.conf <<'EOF'
+[LightDM]
+logind-check-graphical=false
+[Seat:*]
+allow-guest=false
+xserver-command=/usr/lib/xorg/Xorg -nolisten tcp
+greeter-session=lightdm-gtk-greeter
+user-session=xfce
+greeter-hide-users=false
+EOF
+    cat > /etc/lightdm/lightdm.conf.d/60-jetson-gpu.conf <<EOF
+# The GPU desktop: X server 1.20 with NVIDIA's X driver (nano-l4t-x11).
+# Remove this file to go back to 26.04's X server on the framebuffer.
+[Seat:*]
+xserver-command=$XSERVER
+EOF
+    # With the session menu add-u26-unity.sh adds, so Unity can be picked there.
+    {
+        printf '[greeter]\n'
+        if [[ -f $WALLPAPER ]]; then printf 'background=%s\n' "$WALLPAPER"; fi
+        printf 'theme-name=Yaru-dark\nicon-theme-name=Yaru\nfont-name=Ubuntu 11\n'
+        printf 'indicators=~host;~spacer;~clock;~spacer;~session;~power\nclock-format=%%a %%d %%b, %%H:%%M\n'
+    } > /etc/lightdm/lightdm-gtk-greeter.conf
+    # System defaults apply only where the account has no personal setting.
+    local xfconf=/etc/xdg/xfce4/xfconf/xfce-perchannel-xml
+    install -d -m 0755 "$xfconf" || return 1
+    cat > "$xfconf/xfwm4.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfwm4" version="1.0">
+  <property name="general" type="empty">
+    <property name="use_compositing" type="bool" value="false"/>
+    <property name="theme" type="string" value="Yaru"/>
+  </property>
+</channel>
+EOF
+    run python3 - <<'PY' || return 1
+from pathlib import Path
+import xml.etree.ElementTree as ET
+p = Path('/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml')
+tree = ET.parse(p); root = tree.getroot()
+for group, key, value in [('Net', 'ThemeName', 'Yaru-dark'), ('Net', 'IconThemeName', 'Yaru'),
+                          ('Gtk', 'FontName', 'Ubuntu 11')]:
+    parent = root.find("property[@name='%s']" % group)
+    if parent is None:
+        parent = ET.SubElement(root, 'property', {'name': group, 'type': 'empty'})
+    child = parent.find("property[@name='%s']" % key)
+    if child is None:
+        child = ET.SubElement(parent, 'property', {'name': key})
+    child.set('type', 'string'); child.set('value', value)
+tree.write(p, encoding='UTF-8', xml_declaration=True)
+PY
+    # The packaged Xfce default names an absent Xubuntu backdrop.
+    if [[ -f $WALLPAPER ]]; then
+        install -d -m 0755 /usr/share/xfce4/backdrops
+        ln -sfn "$WALLPAPER" /usr/share/xfce4/backdrops/xubuntu-wallpaper.png
+    fi
+    # Unity's defaults for what this root has; an account's own settings win.
+    {
+        printf '# Unity on the Nano (add-u26-unity.sh): the wallpaper and launcher items this root has.\n'
+        if [[ -f $WALLPAPER ]]; then
+            printf "[org.gnome.desktop.background:Unity]\npicture-uri = 'file://%s'\npicture-uri-dark = 'file://%s'\n\n" \
+                "$WALLPAPER" "$WALLPAPER"
+        fi
+        printf '[com.canonical.Unity.Launcher]\nfavorites = %s\n' "$FAVORITES"
+    } > /usr/share/glib-2.0/schemas/90_nano-u26-unity.gschema.override
+    run glib-compile-schemas /usr/share/glib-2.0/schemas || return 1
+    # Unity's file manager would show, and offer to mount, the card's own partitions.
+    cat > /etc/udev/rules.d/80-nano-hide-card.rules <<'EOF'
+# The desktop's disk tools (udisks2) leave the SD card's partitions alone:
+# APP and JetPack's boot partitions (add-u26-unity.sh).
+SUBSYSTEM=="block", KERNEL=="mmcblk0p[0-9]*", ENV{UDISKS_IGNORE}="1"
+EOF
+    run systemctl enable lightdm.service
+}
+
+step_video() {
+    deliver "$build/video-probe" scripts/jetson/probe-l4t-video.sh tests/video/frame_check.py \
+        tests/video/colour_fit.py tests/video/vic_cuda.py || return 1
+    local release status=0
+    for release in r35 r32; do
+        as_owner bash "$build/video-probe/probe-l4t-video.sh" --installed "$release" || status=1
+        result L4T_VIDEO_PROBE
+    done
+    return "$status"
+}
+
+# --- Before the steps.
+
+say "starting on $(uname -r)"
+[ -f "$state/first-boot.done" ] || fail 'the first boot has not finished'
+owner=$(setting owner)
+IFS=: read -r _ _ uid _ _ home _ < <(getent passwd "$owner") || fail "no account '$owner' (owner= in $state/settings)"
+group=$(id -gn "$owner")
+[ "$uid" -ge 1000 ] && [ -d "$home" ] || fail "$owner is not a person's account with a home folder"
+if (( systemd )); then
+    [ "$(uname -r)" = "$KERNEL" ] || fail "this is the $(uname -r) kernel, not $KERNEL"
+fi
+(cd "$repo" && sha256sum --quiet -c SHA256SUMS) >> "$log" 2>&1 || fail "$repo does not match its SHA256SUMS"
+# A power cut during an earlier install leaves dpkg to finish first.
+run dpkg --configure -a || fail 'dpkg --configure -a'
+install -d -m 0755 -o "$owner" -g "$group" "$build" || fail "cannot create $build"
+# The CUDA 12 build hard-links its sources from the mirror, which the kernel
+# allows only for files the builder owns (fs.protected_hardlinks).
+if [ -d "$mirror" ]; then
+    chown -R "$owner:$group" "$mirror" || fail "cannot give $mirror to $owner"
+fi
+[ -f "$report" ] || printf 'nano26 stage 2, owner %s, started %s on %s\n' "$owner" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(uname -r)" > "$report"
+
+for name in "${STEPS[@]}"; do
+    if [ -f "$marks/$name.done" ]; then
+        say "$name: passed before"
+        continue
+    fi
+    say "$name: ${ABOUT[$name]}"
+    note "STEP $name ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+    log_start=$(wc -l < "$log")
+    "step_${name//-/_}" || fail "$name"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$marks/$name.done"
+    note "PASS $name"
+done
+
+# --- Finishing.
+say 'finishing'
+{
+    printf 'Installed:\n'
+    dpkg-query -W -f '  ${Package} ${Version}\n' 'nano-l4t-*' nano-cuda12 nano-cuda12-dev nano-trt82 \
+        cuda-cudart-11-4 libcudnn8 libnvinfer8 2> /dev/null
+    printf "Records in %s's home: u26-r35-check, nano-cuda12-install, trt82-install, l4t-video-probe\n" "$owner"
+} >> "$report"
+rm -rf "$mirror" "$build" "$home/nano-trt82-package"
+run apt-get clean || fail 'apt-get clean'
+run systemctl set-default graphical.target || fail 'could not make the desktop the default'
+run systemctl disable nano26-stage2.service || fail 'could not disable nano26-stage2.service'
+date -u +%Y-%m-%dT%H:%M:%SZ > "$state/stage2.done"
+note "DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+sync
+say 'NANO26_STAGE2=DONE'
+if (( systemd )); then
+    say 'restarting into the desktop'
+    systemctl --no-block reboot
+fi
+exit 0

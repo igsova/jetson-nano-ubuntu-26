@@ -1,0 +1,149 @@
+nvgpu: accept CUDA 10.2's address-space requests
+
+JetPack 4's CUDA 10.2 libraries make 35 different requests (ioctls) of the
+GPU driver. Three of them changed size between L4T R32 and R35, and R35's
+nvgpu matches request numbers exactly, so it refuses the old ones:
+NVGPU_GPU_IOCTL_ALLOC_AS (16 bytes in R32), NVGPU_AS_IOCTL_ALLOC_SPACE
+(24 bytes) and NVGPU_AS_IOCTL_FREE_SPACE (16 bytes).
+
+Serve R32's layouts beside R35's. ALLOC_AS fills the R35-only address range
+the way R32's driver chose it; ALLOC_SPACE and FREE_SPACE are translated
+field by field into R35's structs and back.
+
+Found: a census of CUDA 10.2's requests on JetPack 4.6.6
+(tests/cuda/ioctl_census.c).
+Tested on the Nano: CUDA 10.2 passed every test under 5.10 in trial 11.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_as.c b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_as.c
+index 1e582a7b8..0f4afc611 100644
+--- a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_as.c
++++ b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_as.c
+@@ -453,6 +453,30 @@ int gk20a_as_dev_release(struct inode *inode, struct file *filp)
+ 	return gk20a_as_release_share(as_share);
+ }
+ 
++/*
++ * L4T R32 (JetPack 4) ALLOC_SPACE and FREE_SPACE, still issued by CUDA 10.2's
++ * libcuda on the Jetson Nano: 32-bit page counts and the older field order.
++ */
++struct nvgpu_r32_as_alloc_space_args {
++	__u32 pages;
++	__u32 page_size;
++	__u32 flags;
++	__u32 padding;
++	union {
++		__u64 offset;
++		__u64 align;
++	} o_a;
++};
++struct nvgpu_r32_as_free_space_args {
++	__u64 offset;
++	__u32 pages;
++	__u32 page_size;
++};
++#define NVGPU_R32_AS_IOCTL_FREE_SPACE \
++	_IOWR(NVGPU_AS_IOCTL_MAGIC, 3, struct nvgpu_r32_as_free_space_args)
++#define NVGPU_R32_AS_IOCTL_ALLOC_SPACE \
++	_IOWR(NVGPU_AS_IOCTL_MAGIC, 6, struct nvgpu_r32_as_alloc_space_args)
++
+ long gk20a_as_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+ 	int err = 0;
+@@ -520,6 +544,34 @@ long gk20a_as_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		err = gk20a_as_ioctl_free_space(as_share,
+ 				(struct nvgpu_as_free_space_args *)buf);
+ 		break;
++	case NVGPU_R32_AS_IOCTL_ALLOC_SPACE:
++	{
++		struct nvgpu_r32_as_alloc_space_args *r32 =
++			(struct nvgpu_r32_as_alloc_space_args *)buf;
++		struct nvgpu_as_alloc_space_args args = {
++			.pages = r32->pages,
++			.page_size = r32->page_size,
++			.flags = r32->flags,
++			.o_a.offset = r32->o_a.offset,
++		};
++
++		err = gk20a_as_ioctl_alloc_space(as_share, &args);
++		r32->o_a.offset = args.o_a.offset;
++		break;
++	}
++	case NVGPU_R32_AS_IOCTL_FREE_SPACE:
++	{
++		struct nvgpu_r32_as_free_space_args *r32 =
++			(struct nvgpu_r32_as_free_space_args *)buf;
++		struct nvgpu_as_free_space_args args = {
++			.offset = r32->offset,
++			.pages = r32->pages,
++			.page_size = r32->page_size,
++		};
++
++		err = gk20a_as_ioctl_free_space(as_share, &args);
++		break;
++	}
+ 	case NVGPU_AS_IOCTL_MAP_BUFFER_EX:
+ #ifdef CONFIG_NVGPU_TRACE
+ 		trace_gk20a_as_ioctl_map_buffer(g->name);
+diff --git a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_ctrl.c b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_ctrl.c
+index a33ce97fc..ebbf8c37f 100644
+--- a/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_ctrl.c
++++ b/nvidia/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_ctrl.c
+@@ -686,6 +686,45 @@ static int gk20a_ctrl_alloc_as(
+ 	return err;
+ }
+ 
++/*
++ * L4T R32 (JetPack 4) ALLOC_AS, still issued by CUDA 10.2's libcuda on the
++ * Jetson Nano. It has no VA range fields, so apply R32's in-kernel layout:
++ * user VA from the low hole to user_size, split at the small-page limit
++ * unless address spaces are unified or big pages are off.
++ */
++struct nvgpu_r32_alloc_as_args {
++	__u32 big_page_size;
++	__s32 as_fd;
++	__u32 flags;
++	__u32 reserved;
++};
++#define NVGPU_R32_GPU_IOCTL_ALLOC_AS \
++	_IOWR(NVGPU_GPU_IOCTL_MAGIC, 8, struct nvgpu_r32_alloc_as_args)
++
++static int gk20a_ctrl_alloc_as_r32(struct gk20a *g,
++		struct nvgpu_r32_alloc_as_args *r32)
++{
++	struct mm_gk20a *mm = &g->mm;
++	struct nvgpu_alloc_as_args args = { .flags = r32->flags };
++	u32 big_page_size = r32->big_page_size;
++	int err;
++
++	if (big_page_size == 0U)
++		big_page_size = g->ops.mm.gmmu.get_default_big_page_size();
++	if (!mm->disable_bigpage)
++		args.big_page_size = big_page_size;
++	args.va_range_start = U64(big_page_size) << U64(10);
++	args.va_range_end = mm->channel.user_size;
++	if (args.big_page_size != 0U &&
++	    !nvgpu_is_enabled(g, NVGPU_MM_UNIFY_ADDRESS_SPACES))
++		args.va_range_split = nvgpu_gmmu_va_small_page_limit();
++
++	err = gk20a_ctrl_alloc_as(g, &args);
++	if (err == 0)
++		r32->as_fd = args.as_fd;
++	return err;
++}
++
+ static int gk20a_ctrl_open_tsg(struct gk20a *g, struct nvgpu_cdev *cdev,
+ 			       struct nvgpu_gpu_open_tsg_args *args)
+ {
+@@ -2429,6 +2468,10 @@ long gk20a_ctrl_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
+ 		err = gk20a_ctrl_alloc_as(g,
+ 			(struct nvgpu_alloc_as_args *)buf);
+ 		break;
++	case NVGPU_R32_GPU_IOCTL_ALLOC_AS:
++		err = gk20a_ctrl_alloc_as_r32(g,
++			(struct nvgpu_r32_alloc_as_args *)buf);
++		break;
+ 	case NVGPU_GPU_IOCTL_OPEN_TSG:
+ 		err = gk20a_ctrl_open_tsg(g, priv->cdev,
+ 			(struct nvgpu_gpu_open_tsg_args *)buf);

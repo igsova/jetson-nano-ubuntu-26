@@ -1,0 +1,49 @@
+clk: tegra: gbus prepare sets the GPU rail's voltage, as in R32
+
+R35 returns -ENOTSUPP from the gbus clock's prepare on kernels from 4.15
+("FIXME Drop this check once dvfs feature is added to K59"). With the hang
+gone (0007), the GPU's clock prepare would fail there and the power-on stop
+with an error.
+
+Do what R32.7.6's copy of this file does: set the GPU rail's voltage for the
+current gbus rate with tegra_dvfs_set_rate(), which R35's built-in Tegra210
+DVFS provides. 0022 does the same for the video engines' buses.
+
+Tested on the Nano: with 0007, the GPU powered on in trial 8.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/clk/tegra/clk-cbus-shared.c b/nvidia/drivers/clk/tegra/clk-cbus-shared.c
+index bd86b5c3b..5aa31c541 100644
+--- a/nvidia/drivers/clk/tegra/clk-cbus-shared.c
++++ b/nvidia/drivers/clk/tegra/clk-cbus-shared.c
+@@ -11,9 +11,7 @@
+ #include <linux/clk-provider.h>
+ #include <linux/clk.h>
+ #include <linux/version.h>
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+ #include <soc/tegra/tegra-dvfs.h>
+-#endif
+ 
+ #include "clk.h"
+ 
+@@ -563,12 +561,14 @@ static unsigned long clk_shared_recalc_rate(struct clk_hw *hw,
+ 
+ static int clk_gbus_prepare(struct clk_hw *hw)
+ {
+-	/* FIXME Drop this check once dvfs feature is added to K59 */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
++	/*
++	 * R35 stubs this out (-ENOTSUPP) for kernels from 4.15, which makes
++	 * every prepare of a gbus user fail, nvgpu's gm20b power-on included.
++	 * Tegra210 DVFS is built on 5.10 (tegra-dvfs.c, tegra210-dvfs.c), so
++	 * raise the GPU rail for the current gbus rate before the GPU clock
++	 * runs, as R32 does.
++	 */
+ 	return tegra_dvfs_set_rate(hw->clk, clk_get_rate(hw->clk));
+-#else
+-	return -ENOTSUPP;
+-#endif
+ }
+ 
+ static void clk_gbus_unprepare(struct clk_hw *hw)

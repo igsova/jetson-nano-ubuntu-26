@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 624" width="960" height="624" role="img" aria-label="Software stack before and after: JetPack 4.6.6 versus Ubuntu 26.04 on JetPack 5's kernel">
+<style>
+  .bg{fill:#ffffff}
+  .t{font-family:-apple-system,"Segoe UI",Helvetica,Arial,"DejaVu Sans",sans-serif;fill:#1d1f21}
+  .m{fill:#5d6166}
+  .h{font-weight:600}
+  .ub{fill:#fbe3d9;stroke:#E95420}
+  .nv{fill:#e6f2d3;stroke:#5c8f00}
+  .pr{fill:#dfeaf6;stroke:#2f6fb3}
+  .kp{fill:#eeece6;stroke:#9a958a}
+  .hw{fill:#f4f2ec;stroke:#b8b3a8}
+  .ln{stroke:#d9d5cc}
+  .ar{stroke:#5d6166;fill:none}
+  .arh{fill:#5d6166}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#0d1117}
+    .t{fill:#e6edf3}
+    .m{fill:#9aa4ae}
+    .ub{fill:#3d2219;stroke:#f07a4a}
+    .nv{fill:#22301a;stroke:#8fd11a}
+    .pr{fill:#182a3e;stroke:#5c9ce0}
+    .kp{fill:#24262a;stroke:#6e7681}
+    .hw{fill:#1b1e23;stroke:#555c66}
+    .ln{stroke:#30363d}
+    .ar{stroke:#9aa4ae}
+    .arh{fill:#9aa4ae}
+  }
+</style>
+<rect class="bg" width="960" height="624" rx="12"/>
+<text x="370.0" y="40" class="t h" font-size="18" text-anchor="middle" >Today: JetPack 4.6.6</text>
+<text x="370.0" y="62" class="t m" font-size="13" text-anchor="middle" >NVIDIA's last release for the Nano</text>
+<text x="760.0" y="40" class="t h" font-size="18" text-anchor="middle" >This project</text>
+<text x="760.0" y="62" class="t m" font-size="13" text-anchor="middle" >Ubuntu 26.04 on JetPack 5's kernel</text>
+<text x="20" y="122.0" class="t m" font-size="13" text-anchor="start" >Desktop</text>
+<rect class="ub" x="190" y="92" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="370.0" y="122.0" class="t" font-size="14" text-anchor="middle" >Ubuntu 18.04 GNOME</text>
+<rect class="ub" x="580" y="92" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="760.0" y="122.0" class="t" font-size="14" text-anchor="middle" >Unity or Xfce, on the GPU</text>
+<line class="ar" x1="556" y1="117.0" x2="567" y2="117.0" stroke-width="1.5"/>
+<path class="arh" d="M574 117.0 l-8 -4.5 v9 z"/>
+<text x="20" y="180.0" class="t m" font-size="13" text-anchor="start" >AI</text>
+<rect class="nv" x="190" y="150" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="370.0" y="180.0" class="t" font-size="14" text-anchor="middle" >CUDA 10.2 · cuDNN 8.2 · TensorRT 8.2</text>
+<rect class="nv" x="580" y="150" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="760.0" y="180.0" class="t" font-size="12.5" text-anchor="middle" >CUDA 11.4 + 12.6 · cuDNN 8.6 + 9.3 · TensorRT 8.2 + 8.5</text>
+<line class="ar" x1="556" y1="175.0" x2="567" y2="175.0" stroke-width="1.5"/>
+<path class="arh" d="M574 175.0 l-8 -4.5 v9 z"/>
+<text x="20" y="238.0" class="t m" font-size="13" text-anchor="start" >Graphics, video</text>
+<rect class="nv" x="190" y="208" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="370.0" y="238.0" class="t" font-size="14" text-anchor="middle" >OpenGL, Vulkan, codecs (JetPack 4)</text>
+<rect class="nv" x="580" y="208" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="760.0" y="238.0" class="t" font-size="12.5" text-anchor="middle" >OpenGL, Vulkan (JetPack 5) · codecs (JetPack 4) · VIC fix</text>
+<line class="ar" x1="556" y1="233.0" x2="567" y2="233.0" stroke-width="1.5"/>
+<path class="arh" d="M574 233.0 l-8 -4.5 v9 z"/>
+<text x="20" y="296.0" class="t m" font-size="13" text-anchor="start" >Operating system</text>
+<rect class="ub" x="190" y="266" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="370.0" y="296.0" class="t" font-size="14" text-anchor="middle" >Ubuntu 18.04 · Python 3.6 · glibc 2.27</text>
+<rect class="ub" x="580" y="266" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="760.0" y="296.0" class="t" font-size="14" text-anchor="middle" >Ubuntu 26.04 LTS · Python 3.14 · systemd 259</text>
+<line class="ar" x1="556" y1="291.0" x2="567" y2="291.0" stroke-width="1.5"/>
+<path class="arh" d="M574 291.0 l-8 -4.5 v9 z"/>
+<text x="20" y="354.0" class="t m" font-size="13" text-anchor="start" >GPU driver</text>
+<rect class="nv" x="190" y="324" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="370.0" y="354.0" class="t" font-size="14" text-anchor="middle" >L4T R32.7.6</text>
+<rect class="pr" x="580" y="324" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="760.0" y="354.0" class="t" font-size="14" text-anchor="middle" >JetPack 5 (R35.6) driver, built for the Nano</text>
+<line class="ar" x1="556" y1="349.0" x2="567" y2="349.0" stroke-width="1.5"/>
+<path class="arh" d="M574 349.0 l-8 -4.5 v9 z"/>
+<text x="20" y="412.0" class="t m" font-size="13" text-anchor="start" >Kernel</text>
+<rect class="nv" x="190" y="382" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="370.0" y="412.0" class="t" font-size="14" text-anchor="middle" >Linux 4.9</text>
+<rect class="pr" x="580" y="382" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="760.0" y="412.0" class="t" font-size="14" text-anchor="middle" >Linux 5.10 + 26 patches for the Nano</text>
+<line class="ar" x1="556" y1="407.0" x2="567" y2="407.0" stroke-width="1.5"/>
+<path class="arh" d="M574 407.0 l-8 -4.5 v9 z"/>
+<text x="20" y="470.0" class="t m" font-size="13" text-anchor="start" >Boot</text>
+<rect class="kp" x="190" y="440" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="370.0" y="470.0" class="t" font-size="14" text-anchor="middle" >Board firmware and boot partitions</text>
+<rect class="kp" x="580" y="440" width="360" height="50" rx="8" stroke-width="1.5"/>
+<text x="760.0" y="470.0" class="t" font-size="14" text-anchor="middle" >Same, never written</text>
+<line class="ar" x1="556" y1="465.0" x2="567" y2="465.0" stroke-width="1.5"/>
+<path class="arh" d="M574 465.0 l-8 -4.5 v9 z"/>
+<rect class="hw" x="190" y="498" width="750" height="50" rx="8" stroke-width="1.5"/>
+<text x="20" y="528.0" class="t m" font-size="13" text-anchor="start" >Hardware</text>
+<text x="565.0" y="528.0" class="t" font-size="14" text-anchor="middle" >Jetson Nano 4GB: Tegra X1, 4 × Cortex-A57, 128-core Maxwell GPU</text>
+<rect class="ub" x="190" y="576" width="16" height="16" rx="4" stroke-width="1.5"/>
+<text x="214" y="589" class="t m" font-size="13" text-anchor="start" >From Ubuntu</text>
+<rect class="nv" x="380" y="576" width="16" height="16" rx="4" stroke-width="1.5"/>
+<text x="404" y="589" class="t m" font-size="13" text-anchor="start" >From NVIDIA</text>
+<rect class="pr" x="570" y="576" width="16" height="16" rx="4" stroke-width="1.5"/>
+<text x="594" y="589" class="t m" font-size="13" text-anchor="start" >Ported by this project</text>
+<rect class="kp" x="760" y="576" width="16" height="16" rx="4" stroke-width="1.5"/>
+<text x="784" y="589" class="t m" font-size="13" text-anchor="start" >Kept as it is</text>
+</svg>

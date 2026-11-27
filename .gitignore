@@ -1,0 +1,42 @@
+# Local artifacts, including full device reports and disk images
+/artifacts/*
+!/artifacts/README.md
+*.img
+*.img.*
+*.iso
+*.raw
+*.qcow2
+*.deb
+*.tar
+*.tar.*
+*.tgz
+*.tbz2
+*.zip
+*.xz
+
+# Local secrets/configuration
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+known_hosts
+
+# Generated code/build files
+__pycache__/
+*.pyc
+.venv/
+*.o
+*.so
+*.a
+/build/
+
+# Editors and operating-system metadata
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

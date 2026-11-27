@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Second-trial variant: put only the GPU behind the upstream tegra-smmu
+ * (the 70019000 memory controller), so nvgpu can use 128 KiB big pages as
+ * it does on 4.9. 17 is TEGRA_SWGROUP_GPU in R35's
+ * include/dt-bindings/memory/tegra210-mc.h; the R32 header in scope
+ * defines a different value under the same name.
+ */
+#include "tegra210-p3448-0000-p3449-0000-b00-r35.dts"
+
+&{/gpu} {
+	iommus = <&{/memory-controller@70019000} 17>;
+};

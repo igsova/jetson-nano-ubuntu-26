@@ -1,0 +1,38 @@
+nvmap: load on Tegra210 and return handles as file descriptors
+
+R35's loadable nvmap refuses to load unless the chip is Tegra186 or newer.
+Accept nvidia,tegra210 too, and build with NVMAP_CONFIG_HANDLE_AS_FD=y:
+R32's nvmap, which JetPack 4's libraries were built against, returns
+handles as file descriptors, where R35 defaults to plain IDs.
+
+Tested on the Nano: CUDA 10.2 passed every test under 5.10 in trial 11.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/video/tegra/nvmap/Makefile.memory.configs b/nvidia/drivers/video/tegra/nvmap/Makefile.memory.configs
+index 2eb230b0b..9f7901d20 100644
+--- a/nvidia/drivers/video/tegra/nvmap/Makefile.memory.configs
++++ b/nvidia/drivers/video/tegra/nvmap/Makefile.memory.configs
+@@ -114,7 +114,7 @@ NVMAP_CONFIG_DEBUG_MAPS := n
+ # This is fallback option to support handle as FD
+ # To support handle as ID, set this to n
+ # This config is useful to debug issue if its due to handle as ID or FD
+-NVMAP_CONFIG_HANDLE_AS_FD := n
++NVMAP_CONFIG_HANDLE_AS_FD := y
+ 
+ # Config for kstable/OOT kernel
+ # This is useful when any kstable/OOT specific checks are needed
+diff --git a/nvidia/drivers/video/tegra/nvmap/nvmap_init.c b/nvidia/drivers/video/tegra/nvmap/nvmap_init.c
+index f5279723d..2b1628654 100644
+--- a/nvidia/drivers/video/tegra/nvmap/nvmap_init.c
++++ b/nvidia/drivers/video/tegra/nvmap/nvmap_init.c
+@@ -935,7 +935,8 @@ static int __init nvmap_init_driver(void)
+ 		goto fail;
+ 
+ #ifdef NVMAP_LOADABLE_MODULE
+-	if (!(of_machine_is_compatible("nvidia,tegra186") ||
++	if (!(of_machine_is_compatible("nvidia,tegra210") ||
++	    of_machine_is_compatible("nvidia,tegra186") ||
+ 	    of_machine_is_compatible("nvidia,tegra194") ||
+ 	    of_machine_is_compatible("nvidia,tegra234") ||
+ 	    of_machine_is_compatible("nvidia,tegra239") ||

@@ -1,0 +1,45 @@
+#!/bin/sh
+# PID 1 for one boot of a new kernel on Ubuntu 26.04 (init= in the
+# u26-next entry). Installed by arm-u26-kernel.sh. Before anything else it puts
+# back the extlinux.conf saved at arming, so the next boot is the previous
+# kernel whatever happens in this one. It changes the file only when it is
+# still the armed file and the saved file is the one recorded at arming, both
+# by SHA-256. Then it execs Ubuntu's systemd. It must never stop before that
+# exec, so every step only logs its failure.
+PATH=/usr/sbin:/usr/bin
+if [ "$$" != 1 ]; then
+    echo 'nano-u26-kernel-once only runs as PID 1 from the u26-next boot entry' >&2
+    exit 2
+fi
+state=/var/lib/nano-u26-kernel
+conf=/boot/extlinux/extlinux.conf
+# systemd accepts /proc and /dev already mounted. Nothing may write to /dev
+# before devtmpfs is there, or it would land on the root filesystem.
+mountpoint -q /proc || mount -t proc proc /proc
+[ -b /dev/mmcblk0p1 ] || mount -t devtmpfs devtmpfs /dev
+# The root as the kernel mounted it: put back read-only if it was.
+ro=0
+while read -r _ dir _ opts _; do
+    [ "$dir" = / ] && case $opts in ro | ro,*) ro=1 ;; *) ro=0 ;; esac
+done < /proc/mounts
+[ "$ro" = 1 ] && mount -o remount,rw /
+log=/var/log/nano-u26/kernel-once-$(cat /proc/sys/kernel/random/boot_id).log
+# A log that cannot be opened would skip the whole block below, so fall back
+# to the kernel log if the root is read-only or full.
+{ mkdir -p /var/log/nano-u26 && true > "$log"; } 2>/dev/null || log=/dev/kmsg
+{
+    echo "kernel once init: $(uname -r) $(uname -v)"
+    cat /proc/cmdline
+    current=$(sha256sum "$conf" | cut -d' ' -f1)
+    saved=$(sha256sum "$state/before.conf" | cut -d' ' -f1)
+    if [ "$current" = "$(cat "$state/armed.sha256")" ] &&
+        [ "$saved" = "$(cat "$state/before.sha256")" ]; then
+        cp "$state/before.conf" "$conf.u26-next" && sync && mv -f "$conf.u26-next" "$conf" && sync &&
+            echo "RESTORED=before $(sha256sum "$conf" | cut -d' ' -f1) armed=$current"
+    else
+        echo "RESTORE_SKIPPED current=$current saved=$saved"
+    fi
+    sync
+} > "$log" 2>&1
+[ "$ro" = 1 ] && mount -o remount,ro /
+exec /usr/lib/systemd/systemd "$@"

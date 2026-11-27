@@ -1,0 +1,57 @@
+phy: tegra: xusb-tegra210: no stack overflow for a lane without a USB 3 port
+
+The PCIe and SATA PHY power-on formats "prod_c_ss%d" with the lane's USB 3
+port into an 11-byte stack buffer. A lane mapped to no USB 3 port, such as
+the Nano's PCIe Ethernet lane, has port -EINVAL: "prod_c_ss-22" needs 13
+bytes, and the stack protector panics ("Kernel stack is corrupted in:
+tegra210_pcie_phy_power_on"). R35 ships only for Tegra186 and newer, where
+this Tegra210 code never runs.
+
+Only lanes mapped to a USB 3 port now look up prod settings, with a 16-byte
+buffer and snprintf.
+
+Found: trial 2, a panic early in the boot.
+Tested on the Nano: trial 3 got through every driver.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/phy/tegra/xusb-tegra210.c b/drivers/phy/tegra/xusb-tegra210.c
+index a65423111..479269306 100644
+--- a/drivers/phy/tegra/xusb-tegra210.c
++++ b/drivers/phy/tegra/xusb-tegra210.c
+@@ -2828,10 +2828,16 @@ static int tegra210_pcie_phy_power_on(struct phy *phy)
+ 
+ 	mutex_lock(&padctl->lock);
+ 
+-	if (priv->prod_list) {
+-		char prod_name[] = "prod_c_ssX";
++	/*
++	 * Only lanes mapped to a USB3 port have prod_c_ss settings. Any other
++	 * lane (the Nano's PCIe Ethernet lane) used to print -EINVAL as "-22"
++	 * past the end of an 11-byte buffer and trip the stack protector.
++	 */
++	if (priv->prod_list && tegra210_usb3_lane_map(lane) >= 0) {
++		char prod_name[16];
+ 
+-		sprintf(prod_name, "prod_c_ss%d", tegra210_usb3_lane_map(lane));
++		snprintf(prod_name, sizeof(prod_name), "prod_c_ss%d",
++			 tegra210_usb3_lane_map(lane));
+ 
+ 		err = tegra_prod_set_by_name(&padctl->regs, prod_name,
+ 				priv->prod_list);
+@@ -3011,10 +3017,12 @@ static int tegra210_sata_phy_power_on(struct phy *phy)
+ 
+ 	mutex_lock(&padctl->lock);
+ 
+-	if (priv->prod_list) {
+-		char prod_name[] = "prod_c_ssX";
++	/* As in tegra210_pcie_phy_power_on(): USB3-mapped lanes only. */
++	if (priv->prod_list && tegra210_usb3_lane_map(lane) >= 0) {
++		char prod_name[16];
+ 
+-		sprintf(prod_name, "prod_c_ss%d", tegra210_usb3_lane_map(lane));
++		snprintf(prod_name, sizeof(prod_name), "prod_c_ss%d",
++			 tegra210_usb3_lane_map(lane));
+ 		err = tegra_prod_set_by_name(&padctl->regs, prod_name,
+ 				priv->prod_list);
+ 		if (err)

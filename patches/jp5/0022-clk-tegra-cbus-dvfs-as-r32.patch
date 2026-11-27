@@ -1,0 +1,86 @@
+clk: tegra: cbus: DVFS on prepare and in rate rounding, as R32
+
+VIC never powered on under 5.10 ("Cannot turn on clock vic03"). The cbus
+clock's prepare returns -ENOTSUPP on kernels from 4.15, the same stub 0008
+removed from gbus, so every prepare of a VIC, NVENC, NVDEC, NVJPG, TSEC-B,
+SE, VI or ISP clock failed. The same file skips DVFS when it rounds a bus
+rate, so a bus could be asked for more than its voltage table allows.
+
+As in R32.7.6's copy of the file: the prepare sets the core rail for the
+bus's current rate, the unprepare drops it, and rounding goes through the
+DVFS table.
+
+Found: trial 32. Tested on the Nano: in trial 33 VIC's clocks matched 4.9's
+(192 MHz) and the clock warnings were gone, with CUDA unchanged. The video
+encoder, decoder and JPEG engine rely on it too (2026-10-22).
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/nvidia/drivers/clk/tegra/clk-cbus-shared.c b/nvidia/drivers/clk/tegra/clk-cbus-shared.c
+index 5aa31c541..42fcf48cc 100644
+--- a/nvidia/drivers/clk/tegra/clk-cbus-shared.c
++++ b/nvidia/drivers/clk/tegra/clk-cbus-shared.c
+@@ -210,8 +210,12 @@ static long clk_cbus_round_rate(struct clk_hw *hw, unsigned long rate,
+ 		return *parent_rate;
+ 	}
+ 
+-	/* FIXME Drop this check once dvfs feature is added to K59 */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
++	/*
++	 * R35 skips DVFS here for kernels from 4.15, so a bus rounds to any
++	 * rate its PLL makes, past the highest rate its DVFS table allows at
++	 * nominal voltage; the DVFS rate-change check then refuses that rate.
++	 * Tegra210 DVFS is built on 5.10, so round to the table as R32 does.
++	 */
+ 	if (!pass_through) {
+ 		dvfs_rate = tegra_dvfs_round_rate(hw->clk, rate);
+ 		if (IS_ERR_VALUE(dvfs_rate))
+@@ -219,7 +223,6 @@ static long clk_cbus_round_rate(struct clk_hw *hw, unsigned long rate,
+ 	}
+ 
+ 	if (pass_through)
+-#endif
+ 		dvfs_rate = rate;
+ 
+ 	new_rate = clk_round_rate(parent, dvfs_rate);
+@@ -274,33 +277,29 @@ static unsigned long _clk_cap_shared_bus(struct clk *c, unsigned long rate,
+ 
+ static int clk_cbus_prepare(struct clk_hw *hw)
+ {
+-	/* FIXME Drop this check once dvfs feature is added to K59 */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
++	/*
++	 * R35 stubs this out (-ENOTSUPP) for kernels from 4.15, which makes
++	 * every prepare of a c2bus, c3bus or cbus user fail: nvhost's VIC
++	 * power-on stopped at "Cannot turn on clock vic03". As for gbus, raise
++	 * the core rail for the current bus rate before the bus runs, as R32
++	 * does.
++	 */
+ 	return tegra_dvfs_set_rate(hw->clk, clk_get_rate(hw->clk));
+-#else
+-	return -ENOTSUPP;
+-#endif
+ }
+ 
+ static void clk_cbus_unprepare(struct clk_hw *hw)
+ {
+-	/* FIXME Drop this check once dvfs feature is added to K59 */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+ 	tegra_dvfs_set_rate(hw->clk, 0);
+-#endif
+ }
+ 
+ static bool bus_user_is_slower(struct tegra_clk_cbus_shared *a,
+ 			       struct tegra_clk_cbus_shared *b)
+ {
+-	/* FIXME Drop this check once dvfs feature is added to K59 */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+ 	if (!a->max_rate)
+ 		a->max_rate = tegra_dvfs_get_maxrate(a->hw.clk);
+ 
+ 	if (!b->max_rate)
+ 		b->max_rate = tegra_dvfs_get_maxrate(b->hw.clk);
+-#endif
+ 
+ 	return a->max_rate < b->max_rate;
+ }

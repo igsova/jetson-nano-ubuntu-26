@@ -1,0 +1,32 @@
+dma-buf: sync_file: log unknown requests (diagnostic)
+
+JetPack 4's user space was built for Android's older sync requests on fence
+fds; 5.10's sync_file refuses them with ENOTTY, silently. Log each refused
+request, rate limited, as "sync_file: unknown ioctl 0x... from <task>".
+
+A diagnostic, kept in the build because 0026's second hunk has these lines
+as context. With 0026 applied, the requests JetPack 4's video converter
+makes are served, and trial 36 logged none.
+
+Used in: trial 35, where it named the two requests 0026 then added.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/dma-buf/sync_file.c b/drivers/dma-buf/sync_file.c
+index f0c822952..bd8ac62be 100644
+--- a/drivers/dma-buf/sync_file.c
++++ b/drivers/dma-buf/sync_file.c
+@@ -473,6 +473,13 @@ static long sync_file_ioctl(struct file *file, unsigned int cmd,
+ 		return sync_file_ioctl_fence_info(sync_file, arg);
+ 
+ 	default:
++		/*
++		 * Jetson Nano trial: JetPack 4's userspace was built for
++		 * Android's older sync interface (ioctls 0 to 2 on the same
++		 * '>' type); show any request this one lacks.
++		 */
++		pr_warn_ratelimited("sync_file: unknown ioctl 0x%x from %s\n",
++				    cmd, current->comm);
+ 		return -ENOTTY;
+ 	}
+ }

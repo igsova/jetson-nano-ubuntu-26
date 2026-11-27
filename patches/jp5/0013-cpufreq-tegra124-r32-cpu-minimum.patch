@@ -1,0 +1,76 @@
+cpufreq: tegra124: R32's 1.2 GHz CPU minimum
+
+4.9 keeps the Nano's CPU at 1.2 GHz or more, which with 0012's floor also
+holds memory at 1600 MHz. Under 5.10 the minimum was 204 MHz: memory fell
+to 204 MHz while the CPU waited on the GPU, and CUDA at the lower GPU
+clocks ran slower than under 4.9.
+
+Add a frequency QoS minimum of 1200000 kHz to the CPU policy on boards with
+R32's nvidia,tegra210-cpufreq node. A lower maximum still wins, so pinning
+the CPU low works as on 4.9.
+
+Found: trial 16. Tested on the Nano: in trial 17 every memory clock sample
+during the CUDA test read 1600 MHz, and the test matched 4.9 at each GPU
+clock.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/cpufreq/tegra124-cpufreq.c b/drivers/cpufreq/tegra124-cpufreq.c
+--- a/drivers/cpufreq/tegra124-cpufreq.c
++++ b/drivers/cpufreq/tegra124-cpufreq.c
+@@ -16,6 +16,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/platform/tegra/emc_bwmgr.h>
+ #include <linux/pm_opp.h>
++#include <linux/pm_qos.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
+ 
+@@ -128,6 +129,47 @@
+ }
+ late_initcall_sync(tegra124_cpu_emc_init);
+ 
++/*
++ * JetPack 4's 4.9 kernel keeps the Nano's CPU at 1.2 GHz or more: its policy
++ * minimum reads 1200000 kHz, and a lower scaling_min_freq reads back as that
++ * unless scaling_max_freq is lower. With the memory floor above, that also
++ * holds EMC at 1600 MHz while the CPU waits on the GPU. Ask cpufreq for the
++ * same minimum on boards with R32's cpufreq node; as on 4.9, a lower maximum
++ * still wins.
++ */
++#define TEGRA210_R32_CPU_MIN_KHZ	1200000
++
++static struct freq_qos_request cpu_min_req;
++
++static int __init tegra124_cpu_min_init(void)
++{
++	struct cpufreq_policy *policy;
++	struct device_node *np;
++	int ret;
++
++	np = of_find_compatible_node(NULL, NULL, "nvidia,tegra210-cpufreq");
++	of_node_put(np);
++	if (!np)
++		return 0;
++
++	policy = cpufreq_cpu_get(0);
++	if (!policy) {
++		pr_warn("no CPU policy for R32's CPU minimum\n");
++		return 0;
++	}
++
++	ret = freq_qos_add_request(&policy->constraints, &cpu_min_req,
++				   FREQ_QOS_MIN, TEGRA210_R32_CPU_MIN_KHZ);
++	cpufreq_cpu_put(policy);
++	if (ret < 0)
++		pr_err("no CPU minimum: %d\n", ret);
++	else
++		pr_info("CPU minimum %u kHz, as R32\n", TEGRA210_R32_CPU_MIN_KHZ);
++
++	return 0;
++}
++late_initcall_sync(tegra124_cpu_min_init);
++
+ static int tegra124_cpu_switch_to_dfll(struct tegra124_cpufreq_priv *priv)
+ {
+ 	struct clk *orig_parent;

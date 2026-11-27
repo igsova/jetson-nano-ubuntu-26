@@ -1,0 +1,628 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Jetson Nano (p3448-0000 module rev 400, p3449-0000 carrier) for the
+ * L4T R35.6 (JetPack 5) 5.10 kernel. Built on NVIDIA's R32.7.6 board
+ * description compiled with LINUX_VERSION=510; see README.md here.
+ */
+#include "tegra210-p3448-0000-p3449-0000-b00.dts"
+
+/*
+ * 5.10 has no plugin manager. Apply the fragments the 4.9 kernel selects
+ * for board IDs 3448-0000-400 and 3449-0000-400 (porg plugin manager
+ * fragement@0, fragment@1 and fragement@13). The odm-data watchdog
+ * fragments are not applied.
+ */
+&{/host1x/i2c@546c0000/ina3221x@40} {
+	channel@0 {
+		ti,rail-name = "POM_5V_IN";
+	};
+	channel@1 {
+		ti,rail-name = "POM_5V_GPU";
+	};
+};
+
+&{/i2c@7000d000/max77620@3c/regulators/sd0} {
+	regulator-min-microvolt = <600000>;
+};
+
+&{/pcie@1003000/pci@2,0} {
+	nvidia,plat-gpios = <&gpio TEGRA_GPIO(CC, 7) GPIO_ACTIVE_HIGH>;
+};
+
+&{/sdhci@700b0400} {
+	vqmmc-supply = <&{/i2c@7000d000/max77620@3c/regulators/ldo6}>;
+	no-sdio;
+	no-mmc;
+	sd-uhs-sdr104;
+	sd-uhs-sdr50;
+	sd-uhs-sdr25;
+	sd-uhs-sdr12;
+};
+
+&{/soctherm@0x700E2000/throttle-cfgs/oc1} {
+	nvidia,priority = <50>;
+	nvidia,polarity-active-low = <1>;
+	nvidia,count-threshold = <1>;
+	nvidia,alarm-filter = <5100000>;
+	nvidia,alarm-period = <0>;
+	nvidia,cpu-throt-percent = <75>;
+	nvidia,gpu-throt-level = <TEGRA_SOCTHERM_THROT_LEVEL_HIGH>;
+};
+
+&{/leds} {
+	status = "okay";
+};
+
+/ {
+	/delete-node/ plugin-manager;
+
+	/*
+	 * nvmap is a module on 5.10 and registers its own carveouts device;
+	 * VPR and IRAM carveouts are left out for the first trial.
+	 */
+	/delete-node/ tegra-carveouts;
+
+	reserved-memory {
+		/delete-node/ vpr-carveout;
+		/delete-node/ iram-carveout;
+
+		/*
+		 * Upstream ramoops binding: keep the last 5.10 console log across a
+		 * warm reset. R32's tegra_ramoops.c layout (64 KiB records, 512 KiB
+		 * console; tegra_defconfig has no ftrace or pmsg zones), so the 4.9
+		 * boot that follows reads the console where 5.10 wrote it.
+		 */
+		ramoops_carveout {
+			compatible = "ramoops";
+			record-size = <0x10000>;
+			console-size = <0x80000>;
+			pmsg-size = <0x0>;
+			ftrace-size = <0x0>;
+		};
+	};
+};
+
+/*
+ * 5.10 has no driver for the downstream "nvidia,tegra210-smmu" node. A
+ * disabled IOMMU node makes every iommus reference fall back to direct
+ * DMA instead of deferring probe forever (of_iommu_xlate).
+ */
+&{/iommu} {
+	status = "disabled";
+};
+
+/* R35's xhci-tegra uses the upstream binding and loads nvidia/tegra210/xusb.bin. */
+&{/xusb@70090000} {
+	compatible = "nvidia,tegra210-xusb";
+	resets = <&tegra_car 89>, <&tegra_car 156>, <&tegra_car 143>;
+	reset-names = "xusb_host", "xusb_ss", "xusb_src";
+};
+
+/* Upstream sdhci-tegra names its timeout clock tmclk and its pad offsets differently. */
+&{/sdhci@700b0000} {
+	clock-names = "sdhci", "pll_p", "tmclk";
+	nvidia,pad-autocal-pull-up-offset-3v3 = <0x00>;
+	nvidia,pad-autocal-pull-down-offset-3v3 = <0x7d>;
+	nvidia,pad-autocal-pull-up-offset-1v8 = <0x7b>;
+	nvidia,pad-autocal-pull-down-offset-1v8 = <0x7b>;
+	/* Upstream tegra210.dtsi values for SDMMC1 (R32 used tap-delay 4, trim-delay 2). */
+	nvidia,default-tap = <0x2>;
+	nvidia,default-trim = <0x4>;
+};
+
+/*
+ * First trial: keep the CPU, memory, power, SD card, USB, PCIe, host1x and
+ * GPU. Leave out display, camera, audio, video engines and downstream test
+ * or debug nodes whose 5.10 drivers or bindings are unverified on T210.
+ * From trial 18 the HDMI head (dc@54200000, sor1, dpaux1) is on; see below.
+ * The second head drives the DP port through sor and stays off.
+ * From trial 31 the USB device controller (xudc) is on, from trial 32
+ * VIC, and from 2026-10-22 the video encoder, decoder and JPEG engines;
+ * see below.
+ */
+&{/host1x/dc@54240000} { status = "disabled"; };
+&{/host1x/sor} { status = "disabled"; };
+&{/host1x/dpaux} { status = "disabled"; };
+&{/tegra_cec} { status = "disabled"; };
+&{/host1x/vi} { status = "disabled"; };
+&{/host1x/vi-bypass} { status = "disabled"; };
+&{/host1x/isp@54600000} { status = "disabled"; };
+&{/host1x/isp@54680000} { status = "disabled"; };
+&{/host1x/i2c@546c0000} { status = "disabled"; };
+&{/mipical} { status = "disabled"; };
+&{/camera-pcl} { status = "disabled"; };
+&{/cam_i2cmux} { status = "disabled"; };
+&{/tegra-camera-platform} { status = "disabled"; };
+&{/host1x/vic} { status = "disabled"; };
+&{/host1x/tsec} { status = "disabled"; };
+&{/host1x/tsecb} { status = "disabled"; };
+&{/aconnect@702c0000} { status = "disabled"; };
+&{/sound} { status = "disabled"; };
+&{/hda@70030000} { status = "disabled"; };
+&{/spdif-dit.0@0} { status = "disabled"; };
+&{/spdif-dit.1@1} { status = "disabled"; };
+&{/spdif-dit.2@2} { status = "disabled"; };
+&{/spdif-dit.3@3} { status = "disabled"; };
+&{/spdif-dit.4@4} { status = "disabled"; };
+&{/spdif-dit.5@5} { status = "disabled"; };
+&{/spdif-dit.6@6} { status = "disabled"; };
+&{/spdif-dit.7@7} { status = "disabled"; };
+&{/xudc@700d0000} { status = "disabled"; };
+&{/mailbox@70098000} { status = "disabled"; };
+&{/smmu_test} { status = "disabled"; };
+&{/dma_test} { status = "disabled"; };
+&{/se@70012000} { status = "disabled"; };
+&{/tegra_udrm} { status = "disabled"; };
+&{/tegra_fiq_debugger} { status = "disabled"; };
+&{/ptm} { status = "disabled"; };
+&{/tegra-supply-tests} { status = "disabled"; };
+&{/actmon@6000c800} { status = "disabled"; };
+&{/mods-simple-bus} { status = "disabled"; };
+&{/soft_watchdog} { status = "disabled"; };
+
+/* Never offer eFuse burning from a trial kernel (also off in the config). */
+&{/efuse@7000f800/efuse-burn} { status = "disabled"; };
+
+/*
+ * Trial 2 (2026-10-13). Trial 1 kept the bootloader's NVIDIA logo on HDMI and
+ * never mounted the root, with no way to see where 5.10 stopped. Hand that
+ * framebuffer to simplefb so fbcon shows the 5.10 console on HDMI: cboot
+ * passes tegra_fbmem=0x800000@0x92ca9000 on this Nano, and the 4.9 log shows
+ * the bootloader mode as 1920x1080. Format and stride are assumed (32 bpp);
+ * a wrong guess garbles the text but cannot harm anything. The buffer is kept
+ * out of the kernel's memory.
+ *
+ * Trial 18 removed this so tegradc's framebuffer would take fbcon, and its
+ * 5.10 boot then stopped before init with only the logo on HDMI. From trial
+ * 19 it is back: the console stays here through the boot, and tegradc,
+ * probed late by the check script, gets the next framebuffer. From trial 23
+ * tegradc's framebuffer takes this one's place when it registers (patch
+ * 0018), so it is fb0 with the console, as under 4.9.
+ */
+/ {
+	reserved-memory {
+		bootfb: framebuffer@92ca9000 {
+			reg = <0x0 0x92ca9000 0x0 0x800000>;
+			no-map;
+			/*
+			 * Trial 23 refers to this node. A fixed phandle above
+			 * the generated ones keeps every other node's (U-Boot
+			 * matches the EMC node's, 0x21, to the bootloader's).
+			 */
+			phandle = <0x1000>;
+		};
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer@92ca9000 {
+			compatible = "simple-framebuffer";
+			reg = <0x0 0x92ca9000 0x0 0x7e9000>;
+			width = <1920>;
+			height = <1080>;
+			stride = <7680>;
+			format = "a8b8g8r8";
+		};
+	};
+};
+
+/*
+ * Trial 5 (2026-10-13). Trial 4 booted 5.10 to userspace, but its log showed
+ * these R32 nodes failing under R35's drivers.
+ */
+
+/*
+ * host1x: "couldn't get assigned clock 5" failed its probe, so nvgpu had no
+ * /dev/nvhost-* and CUDA found no device. R32 hands host1x the camera clock
+ * defaults, and entry 5 is CLK_OUT_3_MUX (358), which 5.10's clock driver does
+ * not have. The camera is disabled above, so the defaults go.
+ */
+&{/host1x} {
+	/delete-property/ assigned-clocks;
+	/delete-property/ assigned-clock-parents;
+	/delete-property/ assigned-clock-rates;
+};
+
+/*
+ * PCIe (the Ethernet port): both links stayed down. The PMC's default state
+ * puts the PEX pads in deep power-down; R32's driver selected "pex-io-dpd-dis"
+ * itself, while R35's (like upstream) only selects "default" and "idle".
+ * These are upstream tegra210.dtsi's states.
+ */
+&{/pcie@1003000} {
+	pinctrl-names = "default", "idle";
+	pinctrl-0 = <&{/pmc@7000e400/pex_en}>;
+	pinctrl-1 = <&{/pmc@7000e400/pex_dis}>;
+	/delete-property/ pinctrl-2;
+	/delete-property/ pinctrl-3;
+	/delete-property/ pinctrl-4;
+	/delete-property/ pinctrl-5;
+};
+
+/*
+ * USB: R35's xhci-tegra probe returned -EINVAL without a message. It takes
+ * the pad controller's interrupt from the padctl node (R32 listed it as the
+ * xusb node's third interrupt), and with no power-domains it falls back to
+ * the legacy powergate calls, which refuse partitions the PMC already
+ * registered as PM domains.
+ */
+&{/xusb_padctl@7009f000} {
+	interrupts = <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>;
+};
+
+&{/xusb@70090000} {
+	power-domains = <&{/pmc@7000e400/powergates/xusbc}>,
+			<&{/pmc@7000e400/powergates/xusba}>;
+	power-domain-names = "xusb_host", "xusb_ss";
+};
+
+/*
+ * GPU power rail: nvgpu waits for tegra210-dvfs, which owns vdd-gpu and needs
+ * the DFLL's CPU voltage table, so the DFLL is back on (trial 2 had disabled
+ * it). R35's DFLL driver reads upstream's PWM properties; these are upstream
+ * tegra210-p3450-0000.dts's values, which equal R32's align-offset-uv,
+ * align-step-uv, init-uv and pwm-period here. Until trial 15 the config left
+ * out tegra124-cpufreq, so the CPU stayed on PLL_X at the bootloader's
+ * 1017.6 MHz and the DFLL only registered its tables; from trial 15 that
+ * driver moves the CPU onto the DFLL, using cpu@0's cpu_g, pll_x, pll_p and
+ * dfll clocks as R32 names them.
+ */
+&{/clock@70110000} {
+	status = "okay";
+	nvidia,pwm-min-microvolts = <708000>;
+	nvidia,pwm-period-nanoseconds = <2500>;
+	nvidia,pwm-tristate-microvolts = <1000000>;
+	nvidia,pwm-voltage-step-microvolts = <19200>;
+};
+
+/*
+ * Trial 6 (2026-10-13). Trial 5's GPU stopped at its first fuse read
+ * ("gcplex-config-fuse nvmem cell read failed -2", then nvgpu_detect_chip
+ * -19). R35's nvgpu reads FUSE_GCPLEX_CONFIG_FUSE_0, the same offset 0x1c8
+ * R32's nvgpu reads with tegra_fuse_readl, through an nvmem cell, and R35's
+ * fuse driver only maps that cell to the T194 GPU. Name it for the Nano's GPU
+ * here; its "calibration" cell already comes from the T210 lookup table.
+ * Cells are read-only; eFuse burning stays disabled above.
+ */
+&{/efuse@7000f800} {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	gcplex_config_fuse: gcplex-config-fuse@1c8 {
+		reg = <0x1c8 0x4>;
+	};
+};
+
+&{/gpu} {
+	nvmem-cells = <&gcplex_config_fuse>;
+	nvmem-cell-names = "gcplex-config-fuse";
+};
+
+/*
+ * Trial 11 (2026-10-13). Trial 10's GPU failed only at its top clock under
+ * 5.10. Its voltage sensor read about 710 mV at every GPU clock while vdd-gpu
+ * (pwm-regulator@1, this controller's channel 1) asked for 818 and then
+ * 1016 mV; under 4.9 it read 818 and 1013 mV. R32's pwm-tegra moved the
+ * controller's clock to its "parent" clock, PLL_P, and ran it at 48 MHz.
+ * R35's driver ignores "parent" and only asks for 48 MHz, so the clock keeps
+ * whatever source the bootloader left. The clock core now sets R32's source
+ * and rate before the driver probes.
+ */
+&{/pwm@7000a000} {
+	assigned-clocks = <&tegra_car TEGRA210_CLK_PWM>;
+	assigned-clock-parents = <&tegra_car TEGRA210_CLK_PLL_P>;
+	assigned-clock-rates = <48000000>;
+};
+
+/*
+ * Trial 12 (2026-10-13). Memory stayed at its 204 MHz boot clock under 5.10
+ * (1600 MHz under 4.9). 5.10's Tegra210 EMC driver, now built and reading
+ * these R32 table nodes (patch 0009), finds the memory controller through
+ * this property, which R32's driver did not need. The bootloader trains the
+ * 1600 MHz table at each boot, and U-Boot copies its trained EMC node into
+ * this file's only when the phandles match: the build checks that this node
+ * keeps R32.7.6's 0x21.
+ */
+&{/external-memory-controller@7001b000} {
+	nvidia,memory-controller = <&{/memory-controller@70019000}>;
+};
+
+/*
+ * Trial 18 (2026-10-14): display. R35's 5.10 kernel still builds JetPack 4's
+ * tegradc driver with its Tegra210 support (CONFIG_TEGRA_DC, TEGRA_HDMI2_0),
+ * and on 5.4 and later it attaches the head's power domains by name on the dc
+ * device: "disa" for head 0, "sor" for the SOR and "dpaux" for the DPAUX,
+ * which share the SOR partition. R32's node has no power-domains (4.9 used
+ * its own partition calls), and without them those lookups return NULL and
+ * the first power-up dereferences it. The domains are 5.10 pmc's powergates.
+ * HDMI's DDC runs on the dpaux1 pads, so dpaux1 is on too.
+ *
+ * Trial 18's boot stopped before init with this on; trial 19's 5.10 entry
+ * holds tegradc's probe until the check script releases it (patch 0015).
+ *
+ * With fb0_carveout still empty (the bootloader does not fill it, and 5.10's
+ * path ignores tegra_fbmem=), tegra_fb allocates its buffer on first use,
+ * 40 MiB by default out of the 64 MiB CMA area that nvgpu also uses without
+ * an IOMMU. 16 MiB holds one 32 bpp buffer up to 2560x1440. (Behind the SMMU
+ * from trial 23, the buffer's pages need not be contiguous.)
+ */
+&{/host1x/dc@54200000} {
+	status = "okay";
+	power-domains = <&{/pmc@7000e400/powergates/dis}>,
+			<&{/pmc@7000e400/powergates/sor}>,
+			<&{/pmc@7000e400/powergates/sor}>;
+	power-domain-names = "disa", "sor", "dpaux";
+	nvidia,fbmem-size = <0x1000000>;
+};
+
+/*
+ * Trial 23 (2026-10-14): head 0 behind the SMMU, as under 4.9. JetPack 4's X
+ * server hands the head buffers that nvmap builds from scattered pages
+ * (trial 22: 2 MiB in 8 to 11 pieces), which tegradc can scan only through
+ * an IOMMU. R32's iommus here name the downstream SMMU node, disabled for
+ * 5.10, so the head fell back to direct DMA. These name upstream
+ * tegra-smmu's swgroups in the memory controller instead: DC (1) and DC1
+ * (34) in R35's tegra210-mc.h, the ASID registers at 0x240 and 0xa88 that
+ * R32 set as DC and DC12. The SMMU starts translating for the head when the
+ * device is attached, at its first probe attempt (about 2.4 s), while the
+ * head still scans the bootloader's buffer for simplefb; R35's
+ * iommu-direct-regions maps that buffer at its own address first.
+ */
+&{/host1x/dc@54200000} {
+	iommus = <&{/memory-controller@70019000} 1>,
+		 <&{/memory-controller@70019000} 34>;
+	iommu-direct-regions = <&bootfb>;
+};
+
+&{/host1x/sor1} {
+	status = "okay";
+};
+
+&{/host1x/dpaux1} {
+	status = "okay";
+};
+
+/*
+ * Trial 37: the SOR partition's resets. 5.10's pmc acquires a domain's resets
+ * before it powers the domain off and asserts them across the power cycle.
+ * R32's node (never read by 4.9, which used its own partition table in
+ * powergate-t21x.c) lists DISP1, the head's own reset, also in "dis". Once the
+ * SOR partition powers off after the head (patch 0028), "dis" would still hold
+ * DISP1 and the SOR's power-off would always find it busy. This is 4.9's list
+ * (upstream's tegra210.dtsi has the same seven): DSIA in DISP1's place, plus
+ * DPAUX and DPAUX1.
+ */
+&{/pmc@7000e400/powergates/sor} {
+	resets = <&tegra_car TEGRA210_CLK_SOR0>,
+		 <&tegra_car TEGRA210_CLK_DSIA>,
+		 <&tegra_car TEGRA210_CLK_DSIB>,
+		 <&tegra_car TEGRA210_CLK_SOR1>,
+		 <&tegra_car TEGRA210_CLK_MIPI_CAL>,
+		 <&tegra_car TEGRA210_CLK_DPAUX>,
+		 <&tegra_car TEGRA210_CLK_DPAUX1>;
+};
+
+/*
+ * Trial 38: the PMIC's interrupt. R32's node gives it type none (0), which
+ * 4.9 accepted and 5.10's GIC driver warns about once at boot
+ * (gic_irq_domain_translate). The PMC inverts the PMIC's active-low
+ * PWR_INT_N (R32's PMC node has nvidia,invert-interrupt), so the GIC sees
+ * SPI 86 active high, and a GIC SPI can only be level high or rising edge.
+ * Linux sets every SPI to level when the GIC starts, so with type none it
+ * already ran level high; this only states it. Upstream's p3450 tree takes
+ * it through the PMC's wake event 51 instead, a larger change than this
+ * trial needs.
+ */
+&{/i2c@7000d000/max77620@3c} {
+	interrupts = <GIC_SPI 86 IRQ_TYPE_LEVEL_HIGH>;
+};
+
+/*
+ * Trial 27 (2026-10-14): per-CPU wake timers. 5.10's tegra210-timer driver
+ * gives each CPU its own timer, TMR10 to TMR13, and takes their interrupts
+ * from entries 10 to 13 of this node, as upstream's tegra210.dtsi lists them.
+ * R32's node lists only those four, so under 5.10 the driver failed ("failed
+ * to map irq for cpu0", -22) and each CPU kept only its arch timer, which
+ * stops while the core is powered down. Trials 2 to 25 kept CPU idle states
+ * off. In trial 26 the CPUs used C7 and the boot stopped at 22 s in a
+ * regulator's probe, most likely waiting for a timer that no longer fired.
+ * This is upstream's list: TMR0 to TMR9, then TMR10 to TMR13 (SPI 176 to 179,
+ * as in R32's node).
+ */
+&{/timer@60005000} {
+	interrupts = <GIC_SPI 156 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 1 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 41 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 152 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 153 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 154 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 155 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 176 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 177 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 178 IRQ_TYPE_LEVEL_HIGH>,
+		     <GIC_SPI 179 IRQ_TYPE_LEVEL_HIGH>;
+};
+
+/*
+ * Trial 30 (2026-10-14): high-speed UARTs. R32 names UARTs B to D
+ * "nvidia,tegra114-hsuart", which only 4.9's serial-tegra matches. R35's
+ * serial-tegra matches "nvidia,tegra30-hsuart", whose chip data has 4.9's
+ * tegra114 values in every field both have (TX FIFO full status, clock
+ * source divider, TX FIFO reset in FIFO mode, FIFO mode status). Under 5.10
+ * there was no /dev/ttyTHS*, and nvgetty failed on ttyTHS1. UART A stays on
+ * 8250 (ttyS0), as under 4.9.
+ */
+&{/serial@70006040} {
+	compatible = "nvidia,tegra114-hsuart", "nvidia,tegra30-hsuart";
+};
+
+&{/serial@70006200} {
+	compatible = "nvidia,tegra114-hsuart", "nvidia,tegra30-hsuart";
+};
+
+&{/serial@70006300} {
+	compatible = "nvidia,tegra114-hsuart", "nvidia,tegra30-hsuart";
+};
+
+/*
+ * Trial 30: CPU cache sizes. 4.9's arm64 cacheinfo read the sizes from the
+ * CPU's CCSIDR registers; 5.10's reads them only from the device tree, and
+ * R32's nodes carry none, so 5.10's sysfs cache directories have no size
+ * file. haveged then read -1 as the L1 data cache size, asked for a 4 GiB
+ * walk buffer and stopped with error 5 (H_NOWALK). These are the Cortex-A57
+ * sizes (48 KiB 3-way and 32 KiB 2-way L1, 2 MiB 16-way L2, 64-byte lines);
+ * the trial compares them with what 4.9 reports from CCSIDR.
+ */
+&{/cpus/cpu@0} {
+	i-cache-size = <0xc000>;
+	i-cache-line-size = <64>;
+	i-cache-sets = <256>;
+	d-cache-size = <0x8000>;
+	d-cache-line-size = <64>;
+	d-cache-sets = <256>;
+};
+
+&{/cpus/cpu@1} {
+	i-cache-size = <0xc000>;
+	i-cache-line-size = <64>;
+	i-cache-sets = <256>;
+	d-cache-size = <0x8000>;
+	d-cache-line-size = <64>;
+	d-cache-sets = <256>;
+};
+
+&{/cpus/cpu@2} {
+	i-cache-size = <0xc000>;
+	i-cache-line-size = <64>;
+	i-cache-sets = <256>;
+	d-cache-size = <0x8000>;
+	d-cache-line-size = <64>;
+	d-cache-sets = <256>;
+};
+
+&{/cpus/cpu@3} {
+	i-cache-size = <0xc000>;
+	i-cache-line-size = <64>;
+	i-cache-sets = <256>;
+	d-cache-size = <0x8000>;
+	d-cache-line-size = <64>;
+	d-cache-sets = <256>;
+};
+
+&{/cpus/l2-cache} {
+	cache-unified;
+	cache-level = <2>;
+	cache-size = <0x200000>;
+	cache-line-size = <64>;
+	cache-sets = <2048>;
+};
+
+/*
+ * Trial 30: 5.10 turned the PMIC's LDO0 (avdd-sys-1v2) off as unused 38 s
+ * into the everyday boot. 4.9 keeps it on (its xHCI driver takes it as
+ * vddio_hsic), and upstream's Nano device tree marks it always-on. Keep it on
+ * as under 4.9.
+ */
+&{/i2c@7000d000/max77620@3c/regulators/ldo0} {
+	regulator-always-on;
+};
+
+/*
+ * Trial 31: USB device mode on the micro-USB port. JetPack 4's
+ * nv-l4t-usb-device-mode binds its gadget to UDC 700d0000.xudc, which 5.10
+ * never registered: the node was off from the first trial, and R35's
+ * tegra-xudc takes the upstream binding (named registers, clocks, PHY and
+ * supplies, and the XUSB device and SuperSpeed power domains). The clocks
+ * are R32's, in R32's order. The supplies are R32's rails under 5.10's names.
+ *
+ * Under 5.10 the port's role comes from a USB role switch on the pad
+ * controller's port, which R35's padctl driver requires for this port
+ * ("usb-role-switch not found for otg mode"), and from a connector that
+ * reports VBUS on GPIO CC4 (usb-conn-gpio, built with the padctl driver),
+ * as in upstream's Nano device tree. That is the pin R32's VBUS extcon
+ * reads for 4.9's xudc; 5.10 builds that extcon driver too, and it would
+ * hold the pin, so it is off.
+ * 4.9's xHCI takes the host role from that extcon's USB-Host cable, which
+ * its two states (USB, none) never set, so the port had no host role under
+ * 4.9 either; the mode is "peripheral", as upstream has it.
+ */
+&{/xudc@700d0000} {
+	status = "okay";
+	reg-names = "base", "fpci", "ipfs";
+	clock-names = "dev", "ss", "ss_src", "hs_src", "fs_src";
+	power-domains = <&{/pmc@7000e400/powergates/xusbb}>,
+			<&{/pmc@7000e400/powergates/xusba}>;
+	power-domain-names = "dev", "ss";
+	phy-names = "usb2-0";
+	hvdd-usb-supply = <&{/regulators/regulator@2}>;
+	avddio-usb-supply = <&{/i2c@7000d000/max77620@3c/regulators/ldo1}>;
+};
+
+&{/xusb_padctl@7009f000/ports/usb2-0} {
+	mode = "peripheral";
+	usb-role-switch;
+
+	connector {
+		compatible = "gpio-usb-b-connector", "usb-b-connector";
+		label = "micro-USB";
+		type = "micro";
+		vbus-gpios = <&gpio TEGRA_GPIO(CC, 4) GPIO_ACTIVE_LOW>;
+	};
+};
+
+&{/extcon/extcon@1} {
+	status = "disabled";
+};
+
+/*
+ * Trial 32: VIC, for JetPack 4's camera daemon (nvargus-daemon failed under
+ * 5.10 opening /dev/nvhost-vic) and its video converters. R35's nvhost still
+ * drives the Tegra210 VIC (t21_vic_info, falcon firmware
+ * tegra21x/vic04_ucode.bin), with R32's clocks (vic03.cbus, vic.floor.cbus;
+ * its EMC clocks go through bwmgr) and the vic powergate. nvhost refuses a
+ * buffer of more than one piece for a device without an IOMMU ("Cannot use
+ * non-contiguous buffer w/ IOMMU disabled"), and pins command buffers to
+ * host1x and data buffers to VIC, so both sit behind upstream tegra-smmu,
+ * as they sat behind 4.9's SMMU: swgroups HC (6) and VIC (22) in R35's
+ * tegra210-mc.h.
+ */
+&{/host1x} {
+	iommus = <&{/memory-controller@70019000} 6>;
+};
+
+&{/host1x/vic} {
+	status = "okay";
+	iommus = <&{/memory-controller@70019000} 22>;
+};
+
+/*
+ * 2026-10-22: the video encoder (NVENC, nvhost's msenc), decoder (NVDEC) and
+ * JPEG engine (NVJPG), for NVIDIA's V4L2 codecs. R35's nvhost still drives
+ * Tegra210's three (t21_msenc_info, t21_nvdec_info, t21_nvjpg_info), with
+ * the falcon firmware the nano-l4t packages carry from R32.7.6 in tegra21x:
+ * nvhost_nvenc050.fw, nvhost_nvjpg010.fw and nvhost_nvdec020_ns.fw, which
+ * NVDEC loads when its secure bootloader pair is absent. Their clocks are
+ * c2bus and c3bus users, which patch 0022 lets prepare. Behind
+ * tegra-smmu as VIC: swgroups NVENC (7), NVDEC (24) and NVJPG (26) in R35's
+ * tegra210-mc.h (R32's nvenc node names the 4.9 SMMU's MPE group instead).
+ */
+&{/host1x/nvenc} {
+	status = "okay";
+	iommus = <&{/memory-controller@70019000} 7>;
+};
+
+&{/host1x/nvdec} {
+	status = "okay";
+	iommus = <&{/memory-controller@70019000} 24>;
+};
+
+&{/host1x/nvjpg} {
+	status = "okay";
+	iommus = <&{/memory-controller@70019000} 26>;
+};

@@ -1,0 +1,366 @@
+memory: tegra210-emc: read R32's timing tables from the device tree
+
+Under 5.10 the memory clock stayed at its 204 MHz boot rate, and a large
+CUDA test ran about nine times slower than under 4.9. R35's config leaves
+the upstream Tegra210 EMC driver out, and that driver takes its timing
+tables only from reserved memory written by a bootloader, which the Nano's
+bootloader does not do. R32 keeps the tables as nvidia,tegra21-emc-table
+nodes under the EMC node, and the bootloader writes its training results
+into them at every boot.
+
+When there is no reserved region, read those nodes: the set for the board's
+RAM code, every property R32's parser reads. Unlike R32, a table with a
+missing property or an oversized register count is refused. Upstream's
+checks then apply unchanged, among them no switch above 204 MHz unless the
+table says it is trained.
+
+Tested off the board: the parser, run in user space on the Nano's device
+tree, matched an independent script field by field for both RAM codes, and
+each kind of malformed table failed the probe.
+Found: trial 11. Tested on the Nano: trial 13 read the tables (1600 MHz
+trained), and with 0010 and 0011 memory ran at 1600 MHz in trial 14.
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/memory/tegra/tegra210-emc-core.c b/drivers/memory/tegra/tegra210-emc-core.c
+index cdd663ba4..75150a4ca 100644
+--- a/drivers/memory/tegra/tegra210-emc-core.c
++++ b/drivers/memory/tegra/tegra210-emc-core.c
+@@ -1824,6 +1824,297 @@ static int tegra210_emc_validate_timings(struct tegra210_emc *emc,
+ 	return 0;
+ }
+ 
++/*
++ * JetPack 4 (L4T R32) device trees carry the EMC tables as nodes under the
++ * EMC node, one set per RAM code, with the fields of struct
++ * tegra210_emc_timing. The bootloader stores its training results in them;
++ * U-Boot copies the node into a device tree loaded from a file. Read them
++ * when no table was passed in reserved memory. This reads what R32's
++ * tegra210-dt-parse.c reads, but fails on a missing property or an oversized
++ * register count instead of logging it and carrying on.
++ */
++struct tegra210_emc_dt_u32 {
++	const char *name;
++	size_t offset;
++	u32 min_revision;
++};
++
++#define EMC_DT_U32(_name, _field, _revision) \
++	{ _name, offsetof(struct tegra210_emc_timing, _field), _revision }
++
++static const struct tegra210_emc_dt_u32 tegra210_emc_dt_u32s[] = {
++	/* first: the revision decides which other properties exist */
++	EMC_DT_U32("nvidia,revision", revision, 0),
++	EMC_DT_U32("clock-frequency", rate, 0),
++	EMC_DT_U32("nvidia,emc-min-mv", min_volt, 0),
++	EMC_DT_U32("nvidia,gk20a-min-mv", gpu_min_volt, 0),
++	EMC_DT_U32("nvidia,src-sel-reg", clk_src_emc, 0),
++	EMC_DT_U32("nvidia,needs-training", needs_training, 0),
++	EMC_DT_U32("nvidia,trained", trained, 0),
++	EMC_DT_U32("nvidia,periodic_training", periodic_training, 6),
++	EMC_DT_U32("nvidia,trained_dram_clktree_c0d0u0", trained_dram_clktree[C0D0U0], 6),
++	EMC_DT_U32("nvidia,trained_dram_clktree_c0d0u1", trained_dram_clktree[C0D0U1], 6),
++	EMC_DT_U32("nvidia,trained_dram_clktree_c0d1u0", trained_dram_clktree[C0D1U0], 6),
++	EMC_DT_U32("nvidia,trained_dram_clktree_c0d1u1", trained_dram_clktree[C0D1U1], 6),
++	EMC_DT_U32("nvidia,trained_dram_clktree_c1d0u0", trained_dram_clktree[C1D0U0], 6),
++	EMC_DT_U32("nvidia,trained_dram_clktree_c1d0u1", trained_dram_clktree[C1D0U1], 6),
++	EMC_DT_U32("nvidia,trained_dram_clktree_c1d1u0", trained_dram_clktree[C1D1U0], 6),
++	EMC_DT_U32("nvidia,trained_dram_clktree_c1d1u1", trained_dram_clktree[C1D1U1], 6),
++	EMC_DT_U32("nvidia,current_dram_clktree_c0d0u0", current_dram_clktree[C0D0U0], 6),
++	EMC_DT_U32("nvidia,current_dram_clktree_c0d0u1", current_dram_clktree[C0D0U1], 6),
++	EMC_DT_U32("nvidia,current_dram_clktree_c0d1u0", current_dram_clktree[C0D1U0], 6),
++	EMC_DT_U32("nvidia,current_dram_clktree_c0d1u1", current_dram_clktree[C0D1U1], 6),
++	EMC_DT_U32("nvidia,current_dram_clktree_c1d0u0", current_dram_clktree[C1D0U0], 6),
++	EMC_DT_U32("nvidia,current_dram_clktree_c1d0u1", current_dram_clktree[C1D0U1], 6),
++	EMC_DT_U32("nvidia,current_dram_clktree_c1d1u0", current_dram_clktree[C1D1U0], 6),
++	EMC_DT_U32("nvidia,current_dram_clktree_c1d1u1", current_dram_clktree[C1D1U1], 6),
++	EMC_DT_U32("nvidia,run_clocks", run_clocks, 6),
++	EMC_DT_U32("nvidia,tree_margin", tree_margin, 6),
++	EMC_DT_U32("nvidia,burst-regs-num", num_burst, 0),
++	EMC_DT_U32("nvidia,burst-regs-per-ch-num", num_burst_per_ch, 0),
++	EMC_DT_U32("nvidia,trim-regs-num", num_trim, 0),
++	EMC_DT_U32("nvidia,trim-regs-per-ch-num", num_trim_per_ch, 0),
++	EMC_DT_U32("nvidia,burst-mc-regs-num", num_mc_regs, 0),
++	EMC_DT_U32("nvidia,la-scale-regs-num", num_up_down, 0),
++	EMC_DT_U32("nvidia,vref-regs-num", vref_num, 0),
++	EMC_DT_U32("nvidia,dram-timing-regs-num", dram_timing_num, 0),
++	EMC_DT_U32("nvidia,min-mrs-wait", min_mrs_wait, 0),
++	EMC_DT_U32("nvidia,emc-mrw", emc_mrw, 0),
++	EMC_DT_U32("nvidia,emc-mrw2", emc_mrw2, 0),
++	EMC_DT_U32("nvidia,emc-mrw3", emc_mrw3, 0),
++	EMC_DT_U32("nvidia,emc-mrw4", emc_mrw4, 0),
++	EMC_DT_U32("nvidia,emc-mrw9", emc_mrw9, 0),
++	EMC_DT_U32("nvidia,emc-mrs", emc_mrs, 0),
++	EMC_DT_U32("nvidia,emc-emrs", emc_emrs, 0),
++	EMC_DT_U32("nvidia,emc-emrs2", emc_emrs2, 0),
++	EMC_DT_U32("nvidia,emc-auto-cal-config", emc_auto_cal_config, 0),
++	EMC_DT_U32("nvidia,emc-auto-cal-config2", emc_auto_cal_config2, 0),
++	EMC_DT_U32("nvidia,emc-auto-cal-config3", emc_auto_cal_config3, 0),
++	EMC_DT_U32("nvidia,emc-auto-cal-config4", emc_auto_cal_config4, 0),
++	EMC_DT_U32("nvidia,emc-auto-cal-config5", emc_auto_cal_config5, 0),
++	EMC_DT_U32("nvidia,emc-auto-cal-config6", emc_auto_cal_config6, 0),
++	EMC_DT_U32("nvidia,emc-auto-cal-config7", emc_auto_cal_config7, 0),
++	EMC_DT_U32("nvidia,emc-auto-cal-config8", emc_auto_cal_config8, 0),
++	EMC_DT_U32("nvidia,emc-cfg-2", emc_cfg_2, 0),
++	EMC_DT_U32("nvidia,emc-sel-dpd-ctrl", emc_sel_dpd_ctrl, 0),
++	EMC_DT_U32("nvidia,emc-fdpd-ctrl-cmd-no-ramp", emc_fdpd_ctrl_cmd_no_ramp, 0),
++	EMC_DT_U32("nvidia,dll-clk-src", dll_clk_src, 0),
++	EMC_DT_U32("nvidia,clk-out-enb-x-0-clk-enb-emc-dll", clk_out_enb_x_0_clk_enb_emc_dll, 0),
++	EMC_DT_U32("nvidia,emc-clock-latency-change", latency, 0),
++};
++
++struct tegra210_emc_dt_array {
++	const char *name;
++	size_t offset;
++	size_t count;	/* offset of the field holding the length */
++	u32 size;
++};
++
++#define EMC_DT_ARRAY(_name, _field, _count)				\
++	{ _name, offsetof(struct tegra210_emc_timing, _field),		\
++	  offsetof(struct tegra210_emc_timing, _count),		\
++	  sizeof_field(struct tegra210_emc_timing, _field) / sizeof(u32) }
++
++static const struct tegra210_emc_dt_array tegra210_emc_dt_arrays[] = {
++	EMC_DT_ARRAY("nvidia,emc-registers", burst_regs, num_burst),
++	EMC_DT_ARRAY("nvidia,emc-burst-regs-per-ch", burst_reg_per_ch, num_burst_per_ch),
++	EMC_DT_ARRAY("nvidia,emc-shadow-regs-ca-train", shadow_regs_ca_train, num_burst),
++	EMC_DT_ARRAY("nvidia,emc-shadow-regs-quse-train", shadow_regs_quse_train, num_burst),
++	EMC_DT_ARRAY("nvidia,emc-shadow-regs-rdwr-train", shadow_regs_rdwr_train, num_burst),
++	EMC_DT_ARRAY("nvidia,emc-trim-regs", trim_regs, num_trim),
++	EMC_DT_ARRAY("nvidia,emc-trim-regs-per-ch", trim_perch_regs, num_trim_per_ch),
++	EMC_DT_ARRAY("nvidia,emc-vref-regs", vref_perch_regs, vref_num),
++	EMC_DT_ARRAY("nvidia,emc-dram-timing-regs", dram_timings, dram_timing_num),
++	EMC_DT_ARRAY("nvidia,emc-burst-mc-regs", burst_mc_regs, num_mc_regs),
++	EMC_DT_ARRAY("nvidia,emc-la-scale-regs", la_scale_regs, num_up_down),
++};
++
++static int tegra210_emc_parse_dt_timing(struct device *dev,
++					struct device_node *np,
++					struct tegra210_emc_timing *timing)
++{
++	u8 *base = (u8 *)timing;
++	const char *name;
++	unsigned int i;
++	int err;
++
++	for (i = 0; i < ARRAY_SIZE(tegra210_emc_dt_u32s); i++) {
++		const struct tegra210_emc_dt_u32 *field = &tegra210_emc_dt_u32s[i];
++
++		if (timing->revision < field->min_revision)
++			continue;
++
++		name = field->name;
++		err = of_property_read_u32(np, name, (u32 *)(base + field->offset));
++		if (err < 0)
++			goto fail;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(tegra210_emc_dt_arrays); i++) {
++		const struct tegra210_emc_dt_array *array = &tegra210_emc_dt_arrays[i];
++		u32 count = *(u32 *)(base + array->count);
++
++		name = array->name;
++		if (count > array->size) {
++			err = -EOVERFLOW;
++			goto fail;
++		}
++
++		err = of_property_read_u32_array(np, name, (u32 *)(base + array->offset),
++						 count);
++		if (err < 0)
++			goto fail;
++	}
++
++	if (timing->revision >= 7) {
++		name = "nvidia,ptfv";
++		err = of_property_read_u32_array(np, name, timing->ptfv_list,
++						 ARRAY_SIZE(timing->ptfv_list));
++		if (err < 0)
++			goto fail;
++	}
++
++	return 0;
++
++fail:
++	dev_err(dev, "%pOF: cannot read %s: %d\n", np, name, err);
++	return err;
++}
++
++/* Parse the children compatible with @compatible; returns how many. */
++static int tegra210_emc_parse_dt_set(struct tegra210_emc *emc,
++				     struct device_node *np,
++				     const char *compatible,
++				     struct tegra210_emc_timing **timingsp)
++{
++	struct tegra210_emc_timing *timings;
++	struct device_node *child;
++	unsigned int count = 0, i = 0;
++	int err;
++
++	for_each_child_of_node(np, child)
++		if (of_device_is_compatible(child, compatible))
++			count++;
++
++	if (!count)
++		return 0;
++
++	timings = devm_kcalloc(emc->dev, count, sizeof(*timings), GFP_KERNEL);
++	if (!timings)
++		return -ENOMEM;
++
++	for_each_child_of_node(np, child) {
++		if (!of_device_is_compatible(child, compatible))
++			continue;
++
++		err = tegra210_emc_parse_dt_timing(emc->dev, child, &timings[i++]);
++		if (err < 0) {
++			of_node_put(child);
++			return err;
++		}
++	}
++
++	*timingsp = timings;
++
++	return count;
++}
++
++/*
++ * The bootloader trains only the nominal table; the trimmers are the same
++ * for the derated one (R32's EMC_COPY_TABLE_PARAM_PERIODIC_FIELDS and
++ * EMC_COPY_TABLE_PARAM_TRIM_REGS).
++ */
++static void tegra210_emc_copy_trained(const struct tegra210_emc_timing *src,
++				      struct tegra210_emc_timing *dst)
++{
++	memcpy(dst->trained_dram_clktree, src->trained_dram_clktree,
++	       sizeof(dst->trained_dram_clktree));
++	memcpy(dst->current_dram_clktree, src->current_dram_clktree,
++	       sizeof(dst->current_dram_clktree));
++	memcpy(dst->trim_perch_regs, src->trim_perch_regs,
++	       src->num_trim_per_ch * sizeof(u32));
++	memcpy(dst->trim_regs, src->trim_regs, src->num_trim * sizeof(u32));
++	memcpy(dst->burst_reg_per_ch, src->burst_reg_per_ch,
++	       src->num_burst_per_ch * sizeof(u32));
++	dst->trained = src->trained;
++}
++
++static int tegra210_emc_parse_dt_tables(struct tegra210_emc *emc,
++					struct device_node *np)
++{
++	static const char * const compatibles[][2] = {
++		{ "nvidia,tegra210-emc-table", "nvidia,tegra210-emc-table-derated" },
++		{ "nvidia,tegra21-emc-table", "nvidia,tegra21-emc-table-derated" },
++	};
++	struct device_node *tables = NULL, *child;
++	u32 ram_code = tegra_read_ram_code(), value;
++	int num_nominal = 0, num_derated, err;
++	unsigned int i;
++
++	if (of_property_read_bool(np, "nvidia,use-ram-code")) {
++		for_each_child_of_node(np, child) {
++			if (!of_property_read_u32(child, "nvidia,ram-code", &value) &&
++			    value == ram_code) {
++				tables = child;
++				break;
++			}
++		}
++
++		if (!tables) {
++			dev_err(emc->dev, "no EMC tables for RAM code %u\n", ram_code);
++			return -ENODEV;
++		}
++	} else {
++		tables = of_node_get(np);
++	}
++
++	for (i = 0; i < ARRAY_SIZE(compatibles); i++) {
++		num_nominal = tegra210_emc_parse_dt_set(emc, tables, compatibles[i][0],
++							&emc->nominal);
++		if (num_nominal)
++			break;
++	}
++
++	if (num_nominal <= 0) {
++		err = num_nominal ?: -ENODEV;
++		goto put;
++	}
++
++	num_derated = tegra210_emc_parse_dt_set(emc, tables, compatibles[i][1],
++						&emc->derated);
++	if (num_derated < 0) {
++		err = num_derated;
++		goto put;
++	}
++
++	if (num_derated && num_derated != num_nominal) {
++		dev_err(emc->dev, "%d derated vs. %d nominal EMC timings\n",
++			num_derated, num_nominal);
++		err = -EINVAL;
++		goto put;
++	}
++
++	emc->num_timings = num_nominal;
++
++	for (i = 0; emc->derated && emc->dram_type == DRAM_TYPE_LPDDR4 &&
++		    i < emc->num_timings; i++)
++		tegra210_emc_copy_trained(&emc->nominal[i], &emc->derated[i]);
++
++	dev_info(emc->dev, "EMC tables from %pOF (RAM code %u): %d nominal, %d derated\n",
++		 tables, ram_code, num_nominal, num_derated);
++
++	for (i = 0; i < emc->num_timings; i++)
++		dev_info(emc->dev, "%u kHz: revision %#x, needs training %#x, trained %u\n",
++			 emc->nominal[i].rate, emc->nominal[i].revision,
++			 emc->nominal[i].needs_training, emc->nominal[i].trained);
++
++	err = 0;
++
++put:
++	of_node_put(tables);
++	return err;
++}
++
+ static int tegra210_emc_probe(struct platform_device *pdev)
+ {
+ 	struct thermal_cooling_device *cd;
+@@ -1883,14 +2174,31 @@ static int tegra210_emc_probe(struct platform_device *pdev)
+ 	/* attach to the nominal and (optional) derated tables */
+ 	err = of_reserved_mem_device_init_by_name(emc->dev, np, "nominal");
+ 	if (err < 0) {
+-		dev_err(emc->dev, "failed to get nominal EMC table: %d\n", err);
+-		goto put_mc;
+-	}
+-
+-	err = of_reserved_mem_device_init_by_name(emc->dev, np, "derated");
+-	if (err < 0 && err != -ENODEV) {
+-		dev_err(emc->dev, "failed to get derated EMC table: %d\n", err);
+-		goto release;
++		/*
++		 * No usable table in reserved memory: read JetPack 4's table
++		 * nodes. U-Boot copies this node's properties from the
++		 * bootloader's device tree but not the reserved-memory regions,
++		 * so a memory-region copied here can name some other node
++		 * (-EINVAL on the Nano with JetPack 4's bootloader).
++		 */
++		if (err != -ENODEV)
++			dev_warn(emc->dev,
++				 "no nominal EMC table in reserved memory: %d\n",
++				 err);
++
++		err = tegra210_emc_parse_dt_tables(emc, np);
++		if (err < 0) {
++			dev_err(emc->dev, "failed to get EMC tables from DT: %d\n",
++				err);
++			goto put_mc;
++		}
++	} else {
++		err = of_reserved_mem_device_init_by_name(emc->dev, np, "derated");
++		if (err < 0 && err != -ENODEV) {
++			dev_err(emc->dev, "failed to get derated EMC table: %d\n",
++				err);
++			goto release;
++		}
+ 	}
+ 
+ 	/* validate the tables */

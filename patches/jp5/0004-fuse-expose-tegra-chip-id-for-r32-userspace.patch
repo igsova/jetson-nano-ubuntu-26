@@ -1,0 +1,44 @@
+soc/tegra: fuse: expose tegra_chip_id where R32's tools read it
+
+R32's tools (nvpmodel, jetson_clocks, tegrastats) read
+/sys/module/tegra_fuse/parameters/tegra_chip_id. R35 provides it only in
+its legacy downstream fuse driver, which conflicts with the upstream one
+this kernel uses. The upstream driver now exposes the same read-only value
+(33 on the Nano).
+
+Licence: GPL-2.0-only. Lab notes, with every measurement: NOTES.md.
+---
+diff --git a/drivers/soc/tegra/fuse/fuse-tegra.c b/drivers/soc/tegra/fuse/fuse-tegra.c
+index fab5f125f..6692130b0 100644
+--- a/drivers/soc/tegra/fuse/fuse-tegra.c
++++ b/drivers/soc/tegra/fuse/fuse-tegra.c
+@@ -7,6 +7,7 @@
+ #include <linux/device.h>
+ #include <linux/kobject.h>
+ #include <linux/init.h>
++#include <linux/moduleparam.h>
+ #include <linux/io.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/nvmem-provider.h>
+@@ -689,3 +690,21 @@ static int __init tegra_init_soc(void)
+ }
+ device_initcall(tegra_init_soc);
+ #endif
++
++/*
++ * L4T R32 (JetPack 4) userspace reads the chip ID from
++ * /sys/module/tegra_fuse/parameters/tegra_chip_id. R35 provides that only in
++ * the legacy downstream fuse driver, which cannot be built with this one.
++ */
++#undef MODULE_PARAM_PREFIX
++#define MODULE_PARAM_PREFIX "tegra_fuse."
++
++static int tegra_fuse_chip_id_get(char *buffer, const struct kernel_param *kp)
++{
++	return sprintf(buffer, "%u\n", tegra_get_chip_id());
++}
++
++static const struct kernel_param_ops tegra_fuse_chip_id_ops = {
++	.get = tegra_fuse_chip_id_get,
++};
++module_param_cb(tegra_chip_id, &tegra_fuse_chip_id_ops, NULL, 0444);

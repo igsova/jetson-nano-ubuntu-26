@@ -1,0 +1,45 @@
+#!/bin/sh
+# PID 1 for the one-shot Ubuntu 26.04 boot on the reference card (init= in APP's u26 entry).
+# Installed in the 26.04 root by arm-u26-oneshot.sh. Before anything else it
+# puts APP's everyday extlinux.conf back, so the next boot is JetPack 4 on the
+# 5.10 kernel whatever happens in this one. It changes APP only when APP's
+# current file is the armed one-shot file and the saved everyday file is the
+# one recorded at arming, both by SHA-256. Then it execs Ubuntu's systemd. It
+# must never stop before that exec, so every step only logs its failure.
+PATH=/usr/sbin:/usr/bin
+if [ "$$" != 1 ]; then
+    echo 'nano-u26-oneshot-init only runs as PID 1 from the u26 boot entry' >&2
+    exit 2
+fi
+lib=/usr/local/lib/nano-u26
+app=$lib/app
+# systemd accepts /proc and /dev already mounted. Nothing may write to /dev
+# before devtmpfs is there, or it would land on the root filesystem.
+mountpoint -q /proc || mount -t proc proc /proc
+[ -b /dev/mmcblk0p1 ] || mount -t devtmpfs devtmpfs /dev
+log=/var/log/nano-u26/oneshot-boot-$(cat /proc/sys/kernel/random/boot_id).log
+# A log that cannot be opened would skip the whole block below, so fall back
+# to the kernel log if the root is read-only or full.
+{ mkdir -p /var/log/nano-u26 && true > "$log"; } 2>/dev/null || log=/dev/kmsg
+{
+    echo "oneshot init: $(uname -r) $(uname -v)"
+    cat /proc/cmdline
+    if mount -t ext4 -o rw,noatime /dev/mmcblk0p1 "$app"; then
+        conf=$app/boot/extlinux/extlinux.conf
+        everyday=$app/var/lib/jp5-trial/extlinux.everyday.conf
+        current=$(sha256sum "$conf" | cut -d' ' -f1)
+        saved=$(sha256sum "$everyday" | cut -d' ' -f1)
+        if [ "$current" = "$(cat "$lib/oneshot.sha256")" ] &&
+            [ "$saved" = "$(cat "$lib/everyday.sha256")" ]; then
+            cp "$everyday" "$conf.u26-next" && sync && mv -f "$conf.u26-next" "$conf" && sync &&
+                echo "RESTORED=everyday $(sha256sum "$conf" | cut -d' ' -f1)"
+        else
+            echo "RESTORE_SKIPPED current=$current everyday=$saved"
+        fi
+        umount "$app" || echo 'APP_UNMOUNT=FAIL'
+    else
+        echo 'APP_MOUNT=FAIL'
+    fi
+    sync
+} > "$log" 2>&1
+exec /usr/lib/systemd/systemd "$@"
