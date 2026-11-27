@@ -22,6 +22,15 @@ packages, entered with `chroot`. In short, **DeepStream runs on the Nano
 under Ubuntu 26.04 and its kernel, but from a JetPack 4 environment, not
 on Ubuntu 26.04's own libraries.**
 
+![DeepStream 6.0.1 drawing boxes around people, cars and road signs in a street clip, on the Nano](img/street-deepstream.gif)
+
+<sub>`install-deepstream.sh --video` on the same stock clip from
+[Pexels](https://www.pexels.com) as the README's YOLO picture: NVIDIA's
+sample ResNet-10 detector, which knows four classes (a bus counts as a
+car). The GIF plays at the clip's speed; 79.5 frames a second is how fast
+the Nano ran the whole pipeline, decoding to encoding, on this clip
+(2026-11-27).</sub>
+
 ## Measured
 
 On the project's Nano, 2026-11-27, with `deepstream-app` on NVIDIA's

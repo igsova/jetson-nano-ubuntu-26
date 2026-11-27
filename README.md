@@ -84,6 +84,8 @@ Works, each tested on the Nano:
   environment beside Ubuntu 26.04: NVIDIA's 1080p sample decoded, run
   through a detector and encoded again at 78 to 86 frames a second
   ([docs/DEEPSTREAM.md](docs/DEEPSTREAM.md)).
+
+  ![DeepStream 6.0.1 drawing boxes around people, cars and road signs in a street clip, on the Nano](docs/img/street-deepstream.gif)
 - USB 2 and 3, Wi-Fi through a USB adapter, a USB webcam with its
   microphone, the 5 W and MAXN power modes and the fan. The CPU, GPU and
   memory reach the same clock speeds as under JetPack 4.
