@@ -55,6 +55,13 @@ packages from a list of files
 ([build-nano-l4t-debs.py](../scripts/host/build-nano-l4t-debs.py)), and none
 of NVIDIA's install scripts or services is carried over.
 
+The optional [DeepStream extra](DEEPSTREAM.md) is the one exception: it
+installs NVIDIA's JetPack 4.6 packages as they are, into a separate Ubuntu
+18.04 folder. Their bootloader and kernel packages are pinned out, and the
+folder has no disk or flash device and cannot make one, so the packages
+there cannot reach the flash; [its page](DEEPSTREAM.md#safety) has the
+details.
+
 ## Can it damage the board?
 
 The kernel decides clock speeds and rail voltages, so this is the right

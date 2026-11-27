@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# nano-deepstream: run a program in DeepStream 6.0.1's JetPack 4 user space.
+#
+# install-deepstream.sh builds an Ubuntu 18.04 root with NVIDIA's JetPack 4.6
+# packages and DeepStream 6.0.1 (default /opt/nano-ds601) and installs this
+# launcher as /usr/local/bin/nano-deepstream. Each run enters that root with
+# chroot from a private mount namespace, so every mount it makes goes away
+# when the program ends:
+#   sudo nano-deepstream deepstream-app -c my-config.txt
+#   sudo nano-deepstream gst-inspect-1.0 nvinfer
+#   sudo nano-deepstream bash                  # a shell in the root
+#
+# The root sees:
+#   - /proc, and /sys read-only;
+#   - a /dev of its own: null, zero, full, random, urandom, tty, a private
+#     pts and shm, and the GPU, display and video nodes the kernel has
+#     (nvhost-*, nvmap, nvgpu, tegra_dc_*, fb*). No disk or flash device;
+#   - no way to make device nodes, mount, use raw I/O or load modules
+#     (those capabilities are dropped before the program starts);
+#   - the folder you run it from, at the same path, when that is under
+#     /home, /mnt or /media, so configs, models and videos there work as
+#     they are. The program starts in it. Files it writes there belong to
+#     root.
+# Settings the root needs on this system: GStreamer finds DeepStream's
+# plugins (GST_PLUGIN_PATH), and EGL is NVIDIA's only
+# (__EGL_VENDOR_LIBRARY_FILENAMES; with Mesa's also offered, NVIDIA's buffer
+# libraries crash, as there is no /dev/dri).
+#
+# Programs that read the keyboard (deepstream-app does) stop if run in the
+# background; give them < /dev/null there. Untested: a window on the screen
+# (nveglglessink), CSI cameras, the Python bindings.
+set -uo pipefail
+
+ROOT=${NANO_DS_ROOT:-/opt/nano-ds601}
+DS=/opt/nvidia/deepstream/deepstream-6.0
+
+if [[ $# -eq 0 || ${1:-} == -h || ${1:-} == --help ]]; then
+    echo 'usage: sudo nano-deepstream PROGRAM [ARGUMENT...]   (for example: deepstream-app -c config.txt)' >&2
+    exit 2
+fi
+[[ $(id -u) -eq 0 ]] || { echo 'nano-deepstream: run it with sudo' >&2; exit 1; }
+[[ -f $ROOT/.nano-ds601-base ]] || { echo "nano-deepstream: no DeepStream root at $ROOT (run install-deepstream.sh)" >&2; exit 1; }
+
+if [[ ${NANO_DS_INNER:-} != 1 ]]; then
+    exec env NANO_DS_INNER=1 unshare --mount --propagation private -- "$(readlink -f "${BASH_SOURCE[0]}")" "$@"
+fi
+
+fail() { echo "nano-deepstream: $*" >&2; exit 1; }
+mount --make-rprivate / || fail 'cannot make the mounts private'
+mount -t proc proc "$ROOT/proc" || fail 'cannot mount proc'
+{ mount --bind /sys "$ROOT/sys" && mount -o remount,bind,ro "$ROOT/sys"; } || fail 'cannot mount sys read-only'
+mount -t tmpfs -o nosuid,mode=0755,size=8m tmpfs "$ROOT/dev" || fail 'cannot mount the root'"'"'s /dev'
+for node in null zero full random urandom tty; do cp -a "/dev/$node" "$ROOT/dev/"; done
+nodes=()
+for node in /dev/nvhost-* /dev/nvmap /dev/nvgpu /dev/dri /dev/tegra_dc_* /dev/fb[0-9]* /dev/nvidia*; do
+    [[ -e $node ]] && nodes+=("$node")
+done
+[[ -e /dev/nvmap && -e /dev/nvhost-ctrl-gpu ]] || fail 'no /dev/nvmap or /dev/nvhost-ctrl-gpu: is this the Nano on its 5.10 kernel?'
+cp -a "${nodes[@]}" "$ROOT/dev/" || fail 'cannot copy the GPU nodes'
+[[ -z $(find "$ROOT/dev" -type b) ]] || fail 'a block device got into the root'"'"'s /dev'
+install -d "$ROOT/dev/pts" "$ROOT/dev/shm"
+mount -t devpts -o newinstance,ptmxmode=0666 devpts "$ROOT/dev/pts" && ln -sf pts/ptmx "$ROOT/dev/ptmx"
+mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs "$ROOT/dev/shm"
+mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs "$ROOT/tmp" || fail 'cannot mount the root'"'"'s /tmp'
+upstream=/run/systemd/resolve/resolv.conf
+[[ -s $upstream ]] || upstream=/etc/resolv.conf
+rm -f "$ROOT/etc/resolv.conf"; cp -L "$upstream" "$ROOT/etc/resolv.conf"
+
+workdir=/root
+case $PWD in
+    /home/*|/mnt/*|/media/*)
+        install -d "$ROOT$PWD" && mount --bind "$PWD" "$ROOT$PWD" && workdir=$PWD ;;
+esac
+
+# The program and everything it starts can no longer make device nodes,
+# mount, touch raw I/O or load kernel modules: nothing in the root can
+# create a way to the card or the module's flash, whatever a package's
+# install script tries.
+cd /
+exec setpriv --bounding-set -mknod,-sys_admin,-sys_rawio,-sys_module,-sys_boot \
+    chroot "$ROOT" /usr/bin/env -i \
+    PATH=$DS/bin:/usr/local/cuda-10.2/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 TERM="${TERM:-dumb}" \
+    DEBIAN_FRONTEND=noninteractive GST_PLUGIN_PATH="$DS/lib/gst-plugins" \
+    __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
+    /bin/sh -c 'cd "$1" && shift && exec "$@"' nano-deepstream "$workdir" "$@"

@@ -80,6 +80,10 @@ Works, each tested on the Nano:
 - Hardware video: H.264 and H.265 decoding and encoding and JPEG decoding,
   and NVIDIA's video converter (VIC), through JetPack 4's GStreamer
   elements (`nano-r32-video gst-launch-1.0 … nvv4l2decoder …`).
+- NVIDIA DeepStream 6.0.1, as an optional extra from a JetPack 4
+  environment beside Ubuntu 26.04: NVIDIA's 1080p sample decoded, run
+  through a detector and encoded again at 86 frames a second
+  ([docs/DEEPSTREAM.md](docs/DEEPSTREAM.md)).
 - USB 2 and 3, Wi-Fi through a USB adapter, a USB webcam with its
   microphone, the 5 W and MAXN power modes and the fan. The CPU, GPU and
   memory reach the same clock speeds as under JetPack 4.
@@ -246,7 +250,7 @@ that showed it fixed), and each patch file opens with its own description.
 | [scripts/](scripts/README.md) | Everything else, by where it runs: on a converted Nano, on a PC (the kernel build, card backup and restore, model export), the two demos, and the probes used during the port |
 | [patches/jp5](patches/jp5/README.md) | The kernel port: 27 patches, the device tree, the config fragment |
 | [tests/](tests/README.md) | The converter's PC tests, and the small programs the checks run on the Nano (CUDA, OpenGL ES, Vulkan, TensorRT, video) |
-| [docs/](docs) | [Architecture](docs/ARCHITECTURE.md), [the converter](docs/CONVERTER.md), [safety](docs/SAFETY.md), [card backup](docs/BACKUP.md), [references](docs/REFERENCES.md), and the [write-up](https://igsova.github.io/jetson-nano-ubuntu-26/) (`docs/index.html`, published with GitHub Pages) |
+| [docs/](docs) | [Architecture](docs/ARCHITECTURE.md), [the converter](docs/CONVERTER.md), [safety](docs/SAFETY.md), [DeepStream](docs/DEEPSTREAM.md), [card backup](docs/BACKUP.md), [references](docs/REFERENCES.md), and the [write-up](https://igsova.github.io/jetson-nano-ubuntu-26/) (`docs/index.html`, published with GitHub Pages) |
 
 ## How it was made
 

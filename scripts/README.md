@@ -7,6 +7,7 @@ Where things are, and which of them you need.
 | [jetson/convert/](jetson/convert) | The Nano | **The converter.** If you only want Ubuntu 26.04 on your Nano, this is the one folder you run anything from |
 | [jetson/](jetson) | The Nano | What the converter's second stage runs, and checks and helpers for a converted system |
 | [jetson/yolo/](jetson/yolo) | The Nano | The two webcam demos, and TensorRT 8.2 |
+| [jetson/deepstream/](jetson/deepstream) | The Nano | Optional: NVIDIA DeepStream 6.0.1 from a JetPack 4 environment ([docs/DEEPSTREAM.md](../docs/DEEPSTREAM.md)) |
 | [host/](host) | A Linux PC | Building the kernel, repackaging NVIDIA's drivers, exporting the demo models, backing up cards |
 | [jetson/probes/](jetson/probes) | The Nano | One-off experiments from the port, kept because they show how each piece was proven |
 | [reference-card/](reference-card) | Both | How the project's own card was built by hand, before the converter existed |
@@ -85,6 +86,17 @@ copied to the Nano as a bundle.
 | `nano_trt.cpp` | The small C library both demos call TensorRT through: TensorRT has no Python bindings for Ubuntu 26.04's Python |
 | `package-trt82.sh`, `install-trt82.sh`, `trt-default.sh` | JetPack 4's TensorRT 8.2 on JetPack 5's driver. It runs these models 1.5 to 1.6 times faster than 8.5 on this GPU |
 | `probe-trt82.sh`, `probe-depth-trt.sh`, `profile-yolo.sh`, `trt-profile.py` | The measurements behind that: per-layer profiles, and which layers of the depth model each TensorRT builds |
+
+## Optional: DeepStream, `jetson/deepstream/`
+
+NVIDIA DeepStream 6.0.1 in an Ubuntu 18.04 folder with JetPack 4.6's
+packages, beside the converted system ([docs/DEEPSTREAM.md](../docs/DEEPSTREAM.md)).
+
+| Script | What it does |
+| --- | --- |
+| `install-deepstream.sh` | Builds the folder (`/opt/nano-ds601`), installs DeepStream and the launcher, and checks it on NVIDIA's sample clip |
+| `nano-deepstream` | Runs a program in that folder: `sudo nano-deepstream deepstream-app -c config.txt` |
+| `uninstall-deepstream.sh` | Removes the folder and the launcher |
 
 ## On a PC: `host/`
 
